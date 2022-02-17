@@ -1,10 +1,10 @@
 # mold: A Modern Linker
 
 mold is a faster drop-in replacement for existing Unix linkers.
-It is several times faster than LLVM lld linker, the second-fastest
+It is several times faster than the LLVM lld linker, the second-fastest
 open-source linker which I originally created a few years ago.
-mold is created for increasing developer productivity by reducing
-build time especially in rapid debug-edit-rebuild cycles.
+mold is designed to increase developer productivity by reducing
+build time, especially in rapid debug-edit-rebuild cycles.
 
 Here is a performance comparison of GNU gold, LLVM lld, and mold for
 linking final debuginfo-enabled executables of major large programs
@@ -169,6 +169,8 @@ replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
 
 </details>
 
+<details><summary>Verify that you are using mold</summary>
+
 mold leaves its identification string in `.comment` section in an output
 file. You can print it out to verify that you are actually using mold.
 
@@ -181,6 +183,8 @@ String dump of section '.comment':
 ```
 
 If `mold` is in `.comment`, the file is created by mold.
+
+</details>
 
 ## Why is mold so fast?
 

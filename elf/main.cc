@@ -35,6 +35,22 @@ static ObjectFile<E> *new_object_file(Context<E> &ctx, MappedFile<Context<E>> *m
 }
 
 template <typename E>
+static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile<Context<E>> *mf,
+                                  std::string archive_name) {
+  static Counter count("parsed_lto_objs");
+  count++;
+
+  ObjectFile<E> *file = read_lto_object(ctx, mf);
+  file->priority = ctx.file_priority++;
+  file->is_in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
+  file->is_alive = !file->is_in_lib;
+  ctx.has_lto_object = true;
+  if (ctx.arg.trace)
+    SyncOut(ctx) << "trace: " << *file;
+  return file;
+}
+
+template <typename E>
 static SharedFile<E> *
 new_shared_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   if (i64 type = ((ElfEhdr<E> *)mf->data)->e_machine; type != E::e_machine)
@@ -64,18 +80,27 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
     return;
   case FileType::AR:
   case FileType::THIN_AR:
-    for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf))
-      if (get_file_type(child) == FileType::ELF_OBJ)
+    for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf)) {
+      switch (get_file_type(child)) {
+      case FileType::ELF_OBJ:
         ctx.objs.push_back(new_object_file(ctx, child, mf->name));
+        break;
+      case FileType::GCC_LTO_OBJ:
+      case FileType::LLVM_BITCODE:
+        ctx.objs.push_back(new_lto_obj(ctx, child, mf->name));
+        break;
+      default:
+        break;
+      }
+    }
     ctx.visited.insert(mf->name);
     return;
   case FileType::TEXT:
     parse_linker_script(ctx, mf);
     return;
+  case FileType::GCC_LTO_OBJ:
   case FileType::LLVM_BITCODE:
-    Warn(ctx) << mf->name << ": looks like this is an LLVM bitcode, "
-              << "but mold does not support LTO";
-    ctx.llvm_lto = true;
+    ctx.objs.push_back(new_lto_obj(ctx, mf, ""));
     return;
   default:
     Fatal(ctx) << mf->name << ": unknown file type: " << type;
@@ -89,6 +114,7 @@ static i64 get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   switch (get_file_type(mf)) {
   case FileType::ELF_OBJ:
   case FileType::ELF_DSO:
+  case FileType::GCC_LTO_OBJ:
     return ((ElfEhdr<E> *)mf->data)->e_machine;
   case FileType::AR:
     for (MappedFile<Context<E>> *child : read_fat_archive_members(ctx, mf))
@@ -421,13 +447,6 @@ static int elf_main(int argc, char **argv) {
     }
   }
 
-  {
-    Timer t(ctx, "register_section_pieces");
-    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      file->register_section_pieces(ctx);
-    });
-  }
-
   // Uniquify shared object files by soname
   {
     std::unordered_set<std::string_view> seen;
@@ -450,23 +469,12 @@ static int elf_main(int argc, char **argv) {
   // included to the final output.
   resolve_symbols(ctx);
 
-  // We currently do not natively support LTO.
-  // If LLVM LTO is in use, fallback to the lld linker by invoking
-  // it with the exact same command line arguments as we got.
-  if (ctx.llvm_lto) {
-    Warn(ctx) << "LLVM LTO is detected, so falling back to ld.lld";
-    argv[0] = (char *)"ld.lld";
-    execvp("ld.lld", argv);
-    Fatal(ctx) << "execvp failed: ld.lld: " << errno_string();
-  }
+  // Do LTO
+  if (ctx.has_lto_object)
+    do_lto(ctx);
 
-  // Do the same for GCC LTO.
-  if (Symbol<E> *sym = get_symbol(ctx, "__gnu_lto_slim"); sym->file) {
-    Warn(ctx) << *sym->file
-              << "GCC LTO is detected, so falling back to ld.bfd";
-    execvp("ld.bfd", argv);
-    Fatal(ctx) << "execvp failed: ld.bfd: " << errno_string();
-  }
+  // Resolve mergeable section pieces to merge them.
+  register_section_pieces(ctx);
 
   // Remove redundant comdat sections (e.g. duplicate inline functions).
   eliminate_comdats(ctx);
@@ -546,6 +554,10 @@ static int elf_main(int argc, char **argv) {
   // .init_array and .fini_array contents have to be sorted by
   // a special rule. Sort them.
   sort_init_fini(ctx);
+
+  // Handle --shuffle-sections
+  if (ctx.arg.shuffle_sections)
+    shuffle_sections(ctx);
 
   // Compute sizes of output sections while assigning offsets
   // within an output section to input sections.
@@ -712,6 +724,9 @@ static int elf_main(int argc, char **argv) {
 
   // Close the output file. This is the end of the linker's main job.
   ctx.output_file->close(ctx);
+
+  if (ctx.has_lto_object)
+    lto_cleanup(ctx);
 
   t_total.stop();
   t_all.stop();

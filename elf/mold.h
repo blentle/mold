@@ -950,8 +950,6 @@ public:
 
   virtual ~InputFile() = default;
 
-  virtual bool is_dso() const = 0;
-
   template<typename T> std::span<T>
   get_data(Context<E> &ctx, const ElfShdr<E> &shdr);
 
@@ -961,10 +959,8 @@ public:
   std::string_view get_string(Context<E> &ctx, const ElfShdr<E> &shdr);
   std::string_view get_string(Context<E> &ctx, i64 idx);
 
-  ElfEhdr<E> &get_ehdr() const { return *(ElfEhdr<E> *)mf->data; }
-  ElfPhdr<E> *get_phdr() const {
-    return (ElfPhdr<E> *)(mf->data + get_ehdr().e_phoff);
-  }
+  ElfEhdr<E> &get_ehdr() { return *(ElfEhdr<E> *)mf->data; }
+  ElfPhdr<E> *get_phdr() { return (ElfPhdr<E> *)(mf->data + get_ehdr().e_phoff); }
 
   ElfShdr<E> *find_section(i64 type);
 
@@ -984,6 +980,7 @@ public:
   i64 first_global = 0;
 
   std::string filename;
+  bool is_dso = false;
   u32 priority;
   std::atomic_bool is_alive = false;
   std::string_view shstrtab;
@@ -1013,7 +1010,6 @@ public:
   static ObjectFile<E> *create(Context<E> &ctx, MappedFile<Context<E>> *mf,
                                std::string archive_name, bool is_in_lib);
 
-  bool is_dso() const override { return false; }
   void parse(Context<E> &ctx);
   void register_section_pieces(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx) override;
@@ -1034,7 +1030,7 @@ public:
   std::string archive_name;
   std::vector<std::unique_ptr<InputSection<E>>> sections;
   std::vector<std::unique_ptr<MergeableSection<E>>> mergeable_sections;
-  const bool is_in_lib = false;
+  bool is_in_lib = false;
   std::vector<ElfShdr<E>> elf_sections2;
   std::vector<CieRecord<E>> cies;
   std::vector<FdeRecord<E>> fdes;
@@ -1043,6 +1039,7 @@ public:
   std::vector<std::pair<ComdatGroup *, std::span<u32>>> comdat_groups;
   bool exclude_libs = false;
   u32 features = 0;
+  bool is_lto_obj = false;
 
   u64 num_dynrel = 0;
   u64 reldyn_offset = 0;
@@ -1093,7 +1090,6 @@ public:
 
   ~SharedFile() = default;
 
-  bool is_dso() const override { return true; }
   void parse(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx) override;
   std::vector<Symbol<E> *> find_aliases(Symbol<E> *sym);
@@ -1192,6 +1188,19 @@ private:
 };
 
 //
+// lto.cc
+//
+
+template <typename E>
+ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mb);
+
+template <typename E>
+void do_lto(Context<E> &ctx);
+
+template <typename E>
+void lto_cleanup(Context<E> &ctx);
+
+//
 // gc-sections.cc
 //
 
@@ -1259,6 +1268,7 @@ template <typename E> void apply_exclude_libs(Context<E> &);
 template <typename E> void create_synthetic_sections(Context<E> &);
 template <typename E> void set_file_priority(Context<E> &);
 template <typename E> void resolve_symbols(Context<E> &);
+template <typename E> void register_section_pieces(Context<E> &);
 template <typename E> void eliminate_comdats(Context<E> &);
 template <typename E> void convert_common_symbols(Context<E> &);
 template <typename E> void compute_merged_section_sizes(Context<E> &);
@@ -1271,6 +1281,7 @@ template <typename E> void print_dependencies_full(Context<E> &);
 template <typename E> void write_repro_file(Context<E> &);
 template <typename E> void check_duplicate_symbols(Context<E> &);
 template <typename E> void sort_init_fini(Context<E> &);
+template <typename E> void shuffle_sections(Context<E> &);
 template <typename E> std::vector<Chunk<E> *>
 collect_output_sections(Context<E> &);
 template <typename E> void compute_section_sizes(Context<E> &);
@@ -1444,6 +1455,7 @@ struct Context {
     bool relocatable = false;
     bool repro = false;
     bool shared = false;
+    bool shuffle_sections = false;
     bool stats = false;
     bool strip_all = false;
     bool strip_debug = false;
@@ -1482,6 +1494,7 @@ struct Context {
     std::string fini = "_fini";
     std::string init = "_init";
     std::string output;
+    std::string plugin;
     std::string rpaths;
     std::string soname;
     std::string sysroot;
@@ -1493,6 +1506,7 @@ struct Context {
     std::vector<std::string_view> auxiliary;
     std::vector<std::string_view> exclude_libs;
     std::vector<std::string_view> filter;
+    std::vector<std::string_view> plugin_opt;
     std::vector<std::string_view> require_defined;
     std::vector<std::string_view> trace_symbol;
     std::vector<std::string_view> undefined;
@@ -1510,12 +1524,12 @@ struct Context {
   bool whole_archive = false;
   bool is_static;
   bool in_lib = false;
-  i64 file_priority = 2;
+  i64 file_priority = 10000;
   std::unordered_set<std::string_view> visited;
   tbb::task_group tg;
 
   bool has_error = false;
-  bool llvm_lto = false;
+  bool has_lto_object = false;
 
   // Symbol table
   tbb::concurrent_hash_map<std::string_view, Symbol<E>, HashCmp> symbol_map;
@@ -1723,7 +1737,7 @@ public:
   InputSection<E> *input_section = nullptr;
   const char *nameptr = nullptr;
 
-  u64 value = -1;
+  u64 value = 0;
 
   // Index into the symbol table of the owner file.
   i32 sym_idx = -1;
@@ -1769,6 +1783,10 @@ public:
   // protected symbol (i.e. a symbol whose visibility is STV_PROTECTED).
   u8 is_imported : 1 = false;
   u8 is_exported : 1 = false;
+
+  // For LTO. True if the symbol is referenced by a regular object (as
+  // opposed to IR object).
+  u8 referenced_by_regular_obj : 1 = false;
 
   // Target-dependent extra members.
   SymbolExtras<E> extra;
@@ -2012,16 +2030,20 @@ inline bool Symbol<E>::operator<(const Symbol &other) const {
 
 template <typename E>
 inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
-  if (SectionFragment<E> *frag = get_frag()) {
-    if (!frag->is_alive) {
-      // This condition is met if a non-alloc section refers an
-      // alloc section and if the referenced piece of data is
-      // garbage-collected. Typically, this condition is met if a
-      // debug info section referring a string constant in .rodata.
-      return 0;
-    }
+  if (file && !file->is_dso) {
+    SectionFragmentRef<E> &ref = ((ObjectFile<E> *)file)->sym_fragments[sym_idx];
 
-    return frag->get_addr(ctx) + value;
+    if (ref.frag) {
+      if (!ref.frag->is_alive) {
+        // This condition is met if a non-alloc section refers an
+        // alloc section and if the referenced piece of data is
+        // garbage-collected. Typically, this condition is met if a
+        // debug info section referring a string constant in .rodata.
+        return 0;
+      }
+
+      return ref.frag->get_addr(ctx) + ref.addend;
+    }
   }
 
   if (has_copyrel) {
@@ -2214,7 +2236,7 @@ inline bool Symbol<E>::has_got(Context<E> &ctx) const {
 
 template <typename E>
 inline bool Symbol<E>::is_absolute() const {
-  if (file->is_dso())
+  if (file->is_dso)
     return esym().is_abs();
   return !is_imported && !get_frag() && !shndx && !input_section;
 }
@@ -2226,14 +2248,14 @@ inline bool Symbol<E>::is_relative() const {
 
 template <typename E>
 inline u32 Symbol<E>::get_type() const {
-  if (esym().st_type == STT_GNU_IFUNC && file->is_dso())
+  if (esym().st_type == STT_GNU_IFUNC && file->is_dso)
     return STT_FUNC;
   return esym().st_type;
 }
 
 template <typename E>
 inline std::string_view Symbol<E>::get_version() const {
-  if (file->is_dso())
+  if (file->is_dso)
     return ((SharedFile<E> *)file)->version_strings[ver_idx];
   return "";
 }
@@ -2245,7 +2267,7 @@ inline const ElfSym<E> &Symbol<E>::esym() const {
 
 template <typename E>
 inline SectionFragment<E> *Symbol<E>::get_frag() const {
-  if (!file || file->is_dso())
+  if (!file || file->is_dso)
     return nullptr;
   return ((ObjectFile<E> *)file)->sym_fragments[sym_idx].frag;
 }

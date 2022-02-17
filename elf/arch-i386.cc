@@ -171,12 +171,8 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       continue;
     }
 
-    if (needs_baserel[i]) {
-      if (!is_relr_reloc(ctx, rel))
-        *dynrel++ = {P, R_386_RELATIVE, 0};
-      write32(S + A);
-      continue;
-    }
+    if (needs_baserel[i] && !is_relr_reloc(ctx, rel))
+      *dynrel++ = {P, R_386_RELATIVE, 0};
 
     switch (rel.r_type) {
     case R_386_8:
@@ -395,7 +391,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         // Absolute  Local    Imported data  Imported code
         {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
         {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       PLT },        // PDE
+        {  NONE,     NONE,    COPYREL,       PLT    },     // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;
@@ -414,9 +410,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_386_PC32: {
       Action table[][4] = {
         // Absolute  Local  Imported data  Imported code
-        {  BASEREL,  NONE,  DYNREL,        DYNREL },     // DSO
-        {  BASEREL,  NONE,  COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,  COPYREL,       PLT   },      // PDE
+        {  ERROR,    NONE,  DYNREL,        DYNREL },     // DSO
+        {  ERROR,    NONE,  COPYREL,       PLT    },     // PIE
+        {  NONE,     NONE,  COPYREL,       PLT    },     // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;
@@ -426,10 +422,16 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_386_GOTPC:
       sym.flags |= NEEDS_GOT;
       break;
-    case R_386_PLT32:
-      if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+    case R_386_PLT32: {
+      Action table[][4] = {
+        // Absolute  Local  Imported data  Imported code
+        {  NONE,     NONE,  PLT,           PLT    },     // DSO
+        {  NONE,     NONE,  PLT,           PLT    },     // PIE
+        {  NONE,     NONE,  PLT,           PLT    },     // PDE
+      };
+      dispatch(ctx, table, i, rel, sym);
       break;
+    }
     case R_386_TLS_GOTIE:
     case R_386_TLS_LE:
     case R_386_TLS_IE:

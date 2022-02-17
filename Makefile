@@ -1,3 +1,7 @@
+# If you want to enable ASAN, run `make` with the following options:
+#
+# make CXXFLAGS=-fsanitize=address LDFLAGS=-fsanitize=address USE_MIMALLOC=0
+
 PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
 LIBDIR = $(PREFIX)/lib
@@ -43,7 +47,7 @@ MOLD_CXXFLAGS := -std=c++20 -fno-exceptions -fno-unwind-tables \
                  -fno-asynchronous-unwind-tables -Ithird-party/xxhash \
                  -DMOLD_VERSION=\"1.0.3\" -DLIBDIR="\"$(LIBDIR)\""
 
-MOLD_LDFLAGS := -pthread -lz -lm
+MOLD_LDFLAGS := -pthread -lz -lm -ldl
 
 GIT_HASH := $(shell [ -d .git ] && git rev-parse HEAD)
 ifneq ($(GIT_HASH),)

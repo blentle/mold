@@ -113,6 +113,7 @@ Options:
   --rpath-link DIR            Ignored
   --run COMMAND ARG...        Run COMMAND with mold as /usr/bin/ld
   --shared, --Bshareable      Create a share library
+  --shuffle-sections[=SEED]   Randomize the output by shuffling input sections
   --sort-common               Ignored
   --sort-section              Ignored
   --spare-dynamic-tags NUMBER Reserve give number of tags in .dynamic section
@@ -133,7 +134,7 @@ Options:
   --warn-common               Warn about common symbols
     --no-warn-common
   --warn-once                 Only warn once for each undefined symbol
-  --warn-shared-textrel       Warn if the output .so needs text relocations
+  --warn-textrel              Warn if the output file needs text relocations
   --warn-unresolved-symbols   Report unresolved symbols as warnings
     --error-unresolved-symbols
                               Report unresolved symbols as errors (default)
@@ -399,7 +400,6 @@ void parse_nonpositional_args(Context<E> &ctx,
   ctx.page_size = E::page_size;
 
   bool version_shown = false;
-  bool warn_shared_textrel = false;
 
   // RISC-V object files contains lots of local symbols, so by default
   // we discard them. This is compatible with GNU ld.
@@ -496,6 +496,8 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.demangle = false;
     } else if (read_flag(args, "default-symver")) {
       ctx.arg.default_symver = true;
+    } else if (read_flag(args, "shuffle-sections")) {
+      ctx.arg.shuffle_sections = true;
     } else if (read_arg(ctx, args, arg, "y") ||
                read_arg(ctx, args, arg, "trace-symbol")) {
       ctx.arg.trace_symbol.push_back(arg);
@@ -598,8 +600,6 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.warn_common = false;
     } else if (read_flag(args, "warn-once")) {
       ctx.arg.warn_once = true;
-    } else if (read_flag(args, "warn-shared-textrel")) {
-      warn_shared_textrel = true;
     } else if (read_flag(args, "warn-textrel")) {
       ctx.arg.warn_textrel = true;
     } else if (read_arg(ctx, args, arg, "compress-debug-sections")) {
@@ -724,6 +724,10 @@ void parse_nonpositional_args(Context<E> &ctx,
       ctx.arg.quick_exit = true;
     } else if (read_flag(args, "no-quick-exit")) {
       ctx.arg.quick_exit = false;
+    } else if (read_arg(ctx, args, arg, "plugin")) {
+      ctx.arg.plugin = arg;
+    } else if (read_arg(ctx, args, arg, "plugin-opt")) {
+      ctx.arg.plugin_opt.push_back(arg);
     } else if (read_arg(ctx, args, arg, "thread-count")) {
       ctx.arg.thread_count = parse_number(ctx, "thread-count", arg);
     } else if (read_flag(args, "threads")) {
@@ -809,8 +813,6 @@ void parse_nonpositional_args(Context<E> &ctx,
     } else if (read_flag(args, "O1")) {
     } else if (read_flag(args, "O2")) {
     } else if (read_flag(args, "verbose")) {
-    } else if (read_arg(ctx, args, arg, "plugin")) {
-    } else if (read_arg(ctx, args, arg, "plugin-opt")) {
     } else if (read_flag(args, "color-diagnostics")) {
     } else if (read_flag(args, "gdb-index")) {
     } else if (read_flag(args, "eh-frame-hdr")) {
@@ -934,9 +936,6 @@ void parse_nonpositional_args(Context<E> &ctx,
     ctx.arg.version_definitions.push_back(ver);
     ctx.default_version = VER_NDX_LAST_RESERVED + 1;
   }
-
-  if (ctx.arg.shared && warn_shared_textrel)
-    ctx.arg.warn_textrel = true;
 
   std::tie(ctx.plt_hdr_size, ctx.plt_size) = get_plt_size(ctx);
 

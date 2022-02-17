@@ -622,12 +622,17 @@ public:
     return std::string_view((char *)data, size);
   }
 
+  i64 get_offset() const {
+    return parent ? (data - parent->data + parent->get_offset()) : 0;
+  }
+
   std::string name;
   u8 *data = nullptr;
   i64 size = 0;
   i64 mtime = 0;
   bool given_fullpath = true;
   MappedFile *parent = nullptr;
+  int fd = -1;
 };
 
 template <typename C>
@@ -670,7 +675,7 @@ template <typename C>
 MappedFile<C> *MappedFile<C>::must_open(C &ctx, std::string path) {
   if (MappedFile *mf = MappedFile::open(ctx, path))
     return mf;
-  Fatal(ctx) << "cannot open " << path;
+  Fatal(ctx) << "cannot open " << path << ": " << errno_string();
 }
 
 template <typename C>

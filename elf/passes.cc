@@ -3,6 +3,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <random>
 #include <regex>
 #include <tbb/parallel_for_each.h>
 #include <tbb/partitioner.h>
@@ -126,6 +127,15 @@ void resolve_symbols(Context<E> &ctx) {
   // Remove unused files
   std::erase_if(ctx.objs, [](InputFile<E> *file) { return !file->is_alive; });
   std::erase_if(ctx.dsos, [](InputFile<E> *file) { return !file->is_alive; });
+}
+
+template <typename E>
+void register_section_pieces(Context<E> &ctx) {
+  Timer t(ctx, "register_section_pieces");
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    file->register_section_pieces(ctx);
+  });
 }
 
 template <typename E>
@@ -567,6 +577,46 @@ void sort_init_fini(Context<E> &ctx) {
   }
 }
 
+template <typename T>
+static void shuffle(std::vector<T> &vec, u64 seed) {
+  if (vec.empty())
+    return;
+
+  // Xorshift random number generator. We use this RNG because it is
+  // measurably faster than MT19937.
+  auto rand = [&]() {
+    seed ^= seed << 13;
+    seed ^= seed >> 7;
+    seed ^= seed << 17;
+    return seed;
+  };
+
+  // The Fisher-Yates shuffling algorithm.
+  //
+  // We don't want to use std::shuffle for build reproducibility. That is,
+  // std::shuffle's implementation is not guaranteed to be the same across
+  // platform, so even though the result is guaranteed to be randomly
+  // shuffled, the exact order may be different across implementations.
+  //
+  // We are not using std::uniform_int_distribution for the same reason.
+  for (i64 i = 0; i < vec.size() - 1; i++)
+    std::swap(vec[i], vec[i + rand() % (vec.size() - i)]);
+}
+
+template <typename E>
+void shuffle_sections(Context<E> &ctx) {
+  Timer t(ctx, "shuffle_sections");
+
+  u64 seed = std::random_device()();
+
+  tbb::parallel_for_each(ctx.output_sections,
+                         [&](std::unique_ptr<OutputSection<E>> &osec) {
+    if (osec->name != ".init" && osec->name != ".fini" &&
+        osec->name != ".init_array" && osec->name != ".fini_array")
+      shuffle(osec->members, seed + hash_string(osec->name));
+  });
+}
+
 template <typename E>
 std::vector<Chunk<E> *> collect_output_sections(Context<E> &ctx) {
   std::vector<Chunk<E> *> vec;
@@ -725,7 +775,7 @@ void scan_rels(Context<E> &ctx) {
       ctx.got->add_tlsdesc_symbol(ctx, sym);
 
     if (sym->flags & NEEDS_COPYREL) {
-      assert(sym->file->is_dso());
+      assert(sym->file->is_dso);
       SharedFile<E> *file = (SharedFile<E> *)sym->file;
       sym->copyrel_readonly = file->is_readonly(ctx, sym);
 
@@ -834,7 +884,7 @@ void apply_version_script(Context<E> &ctx) {
   if (is_simple()) {
     for (VersionPattern &v : ctx.version_patterns)
       if (Symbol<E> *sym = get_symbol(ctx, v.pattern);
-          sym->file && !sym->file->is_dso())
+          sym->file && !sym->file->is_dso)
         sym->ver_idx = v.ver_idx;
     return;
   }
@@ -922,8 +972,7 @@ void compute_import_export(Context<E> &ctx) {
   if (!ctx.arg.shared) {
     tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
       for (Symbol<E> *sym : file->symbols) {
-        if (sym->file && !sym->file->is_dso() &&
-            sym->visibility != STV_HIDDEN) {
+        if (sym->file && !sym->file->is_dso && sym->visibility != STV_HIDDEN) {
           std::scoped_lock lock(sym->mu);
           sym->is_exported = true;
         }
@@ -937,7 +986,7 @@ void compute_import_export(Context<E> &ctx) {
           sym->ver_idx == VER_NDX_LOCAL)
         continue;
 
-      if (sym->file != file && sym->file->is_dso()) {
+      if (sym->file != file && sym->file->is_dso) {
         sym->is_imported = true;
         continue;
       }
@@ -1277,6 +1326,7 @@ void compress_debug_sections(Context<E> &ctx) {
   template void apply_exclude_libs(Context<E> &);                       \
   template void create_synthetic_sections(Context<E> &);                \
   template void resolve_symbols(Context<E> &);                          \
+  template void register_section_pieces(Context<E> &);                  \
   template void eliminate_comdats(Context<E> &);                        \
   template void convert_common_symbols(Context<E> &);                   \
   template void compute_merged_section_sizes(Context<E> &);             \
@@ -1288,6 +1338,7 @@ void compress_debug_sections(Context<E> &ctx) {
   template void write_repro_file(Context<E> &);                         \
   template void check_duplicate_symbols(Context<E> &);                  \
   template void sort_init_fini(Context<E> &);                           \
+  template void shuffle_sections(Context<E> &);                         \
   template std::vector<Chunk<E> *> collect_output_sections(Context<E> &); \
   template void compute_section_sizes(Context<E> &);                    \
   template void claim_unresolved_symbols(Context<E> &);                 \
