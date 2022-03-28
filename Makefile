@@ -2,6 +2,8 @@
 #
 # make CXXFLAGS=-fsanitize=address LDFLAGS=-fsanitize=address USE_MIMALLOC=0
 
+VERSION = 1.1.1
+
 PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
 LIBDIR = $(PREFIX)/lib
@@ -45,7 +47,7 @@ CXXFLAGS = -O2
 
 MOLD_CXXFLAGS := -std=c++20 -fno-exceptions -fno-unwind-tables \
                  -fno-asynchronous-unwind-tables -Ithird-party/xxhash \
-                 -DMOLD_VERSION=\"1.0.3\" -DLIBDIR="\"$(LIBDIR)\""
+                 -DMOLD_VERSION=\"$(VERSION)\" -DLIBDIR="\"$(LIBDIR)\""
 
 MOLD_LDFLAGS := -pthread -lz -lm -ldl
 
@@ -71,6 +73,7 @@ endif
 
 ifeq ($(USE_MIMALLOC), 1)
   ifdef SYSTEM_MIMALLOC
+    MOLD_CXXFLAGS += -DUSE_SYSTEM_MIMALLOC
     MOLD_LDFLAGS += -lmimalloc
   else
     MIMALLOC_LIB = out/mimalloc/libmimalloc.a
@@ -94,8 +97,12 @@ ifeq ($(OS), Linux)
   endif
 endif
 
-# Use pkg-config to know where libcrypto resides.
+NEEDS_LIBCRYPTO = 0
 ifneq ($(OS), Darwin)
+  NEEDS_LIBCRYPTO = 1
+endif
+
+ifeq ($(NEEDS_LIBCRYPTO), 1)
   MOLD_CXXFLAGS += $(shell $(PKG_CONFIG) --cflags-only-I openssl)
   MOLD_LDFLAGS += $(shell $(PKG_CONFIG) --libs-only-L openssl) -lcrypto
 endif

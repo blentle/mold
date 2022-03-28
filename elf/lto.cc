@@ -82,9 +82,11 @@
 #include "../lto.h"
 
 #include <cstdarg>
+#include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sstream>
+#include <unistd.h>
 
 #if 0
 # define LOG std::cerr
@@ -99,8 +101,9 @@ namespace mold::elf {
 // as the LTO plugin is not thread-safe by design anyway.
 
 template <typename E> static Context<E> *gctx;
+template <typename E> static std::vector<ObjectFile<E> *> lto_objects;
+
 static int phase = 0;
-static void *dlopen_handle;
 static std::vector<PluginSymbol> plugin_symbols;
 static ClaimFileHandler *claim_file_hook;
 static AllSymbolsReadHandler *all_symbols_read_hook;
@@ -112,7 +115,9 @@ static PluginStatus message(int level, const char *fmt, ...) {
   LOG << "message\n";
   va_list ap;
   va_start(ap, fmt);
+  fprintf(stderr, "mold: ");
   vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
   return LDPS_OK;
 }
 
@@ -156,14 +161,13 @@ static PluginStatus add_input_file(const char *path) {
   MappedFile<Context<E>> *mf = MappedFile<Context<E>>::must_open(ctx, path);
 
   ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, "", false);
-  ctx.obj_pool.push_back(std::unique_ptr<ObjectFile<E>>(file));
-  ctx.objs.push_back(file);
+  ctx.obj_pool.emplace_back(file);
+  lto_objects<E>.push_back(file);
 
   file->priority = file_priority++;
   file->is_alive = true;
   file->parse(ctx);
   file->resolve_symbols(ctx);
-  file->mark_live_objects(ctx, [](InputFile<E> *) { unreachable(); });
   return LDPS_OK;
 }
 
@@ -266,9 +270,10 @@ get_symbols(const void *handle, int nsyms, PluginSymbol *psyms, bool is_v2) {
   // to the final result, we need to make the plugin to ignore all
   // symbols.
   if (!file.is_alive) {
+    assert(!is_v2);
     for (int i = 0; i < nsyms; i++)
       psyms[i].resolution = LDPR_PREEMPTED_REG;
-    return is_v2 ? LDPS_OK : LDPS_NO_SYMS;
+    return LDPS_NO_SYMS;
   }
 
   auto get_resolution = [&](ElfSym<E> &esym, Symbol<E> &sym) {
@@ -360,11 +365,11 @@ static void load_plugin(Context<E> &ctx) {
   phase = 1;
   gctx<E> = &ctx;
 
-  dlopen_handle = dlopen(ctx.arg.plugin.c_str(), RTLD_NOW | RTLD_GLOBAL);
-  if (!dlopen_handle)
+  void *handle = dlopen(ctx.arg.plugin.c_str(), RTLD_NOW | RTLD_GLOBAL);
+  if (!handle)
     Fatal(ctx) << "could not open plugin file: " << dlerror();
 
-  OnloadFn *onload = (OnloadFn *)dlsym(dlopen_handle, "onload");
+  OnloadFn *onload = (OnloadFn *)dlsym(handle, "onload");
   if (!onload)
     Fatal(ctx) << "failed to load plugin " << ctx.arg.plugin << ": "
                << dlerror();
@@ -472,13 +477,29 @@ static ElfSym<E> to_elf_sym(PluginSymbol &psym) {
   return esym;
 }
 
+// Returns true if a given linker plugin looks like LLVM's one.
+// Returns false if it's GCC.
+template <typename E>
+static bool is_llvm(Context<E> &ctx) {
+  return ctx.arg.plugin.ends_with("LLVMgold.so");
+}
+
+// Returns true if a given linker plugin supports the get_symbols_v3 API.
+// Currently, we simply assume that LLVM supports it and GCC does not.
+template <typename E>
+static bool suppots_v3_api(Context<E> &ctx) {
+  return is_llvm(ctx);
+}
+
 template <typename E>
 ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   LOG << "read_lto_object: " << mf->name << "\n";
 
   if (ctx.arg.plugin.empty())
-    Fatal(ctx) << mf->name << ": don't know how to handle this LTO object file"
-               << " because no -plugin option was given";
+    Fatal(ctx) << mf->name << ": don't know how to handle this LTO object file "
+               << "because no -plugin option was given. Please make sure you "
+               << "added -flto not only for creating object files but also for "
+               << "creating the final executable.";
 
   // dlopen the linker plugin file
   static std::once_flag flag;
@@ -486,6 +507,8 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 
   // Create mold's object instance
   ObjectFile<E> *obj = new ObjectFile<E>;
+  ctx.obj_pool.emplace_back(obj);
+
   obj->filename = mf->name;
   obj->symbols.push_back(new Symbol<E>);
   obj->first_global = 1;
@@ -493,27 +516,38 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   obj->mf = mf;
 
   // Create plugin's object instance
-  PluginInputFile *file = new PluginInputFile;
+  PluginInputFile file = {};
 
   MappedFile<Context<E>> *mf2 = mf->parent ? mf->parent : mf;
-  file->name = save_string(ctx, mf2->name).data();
+  file.name = save_string(ctx, mf2->name).data();
   if (mf2->fd == -1)
-    mf2->fd = open(file->name, O_RDONLY);
-  file->fd = mf2->fd;
-  if (file->fd == -1)
-    Fatal(ctx) << "cannot open " << file->name << ": " << errno_string();
+    mf2->fd = open(file.name, O_RDONLY);
+  file.fd = mf2->fd;
+  if (file.fd == -1)
+    Fatal(ctx) << "cannot open " << file.name << ": " << errno_string();
 
-  file->offset = mf->get_offset();
-  file->filesize = mf->size;
-  file->handle = (void *)obj;
+  if (mf->parent)
+    obj->archive_name = mf->parent->name;
+
+  file.offset = mf->get_offset();
+  file.filesize = mf->size;
+  file.handle = (void *)obj;
 
   LOG << "read_lto_symbols: "<< mf->name << "\n";
 
   // claim_file_hook() calls add_symbols() which initializes `plugin_symbols`
   int claimed = false;
-  claim_file_hook(file, &claimed);
+  claim_file_hook(&file, &claimed);
   if (!claimed)
     Fatal(ctx) << mf->name << ": not claimed by the LTO plugin";
+
+  // It looks like GCC doesn't need fd after claim_file_hook() while
+  // LLVM needs it and takes the ownership of fd. To prevent "too many
+  // open files" issue, we close fd only for GCC. This is ugly, though.
+  if (!is_llvm(ctx)) {
+    close(mf2->fd);
+    mf2->fd = -1;
+  }
 
   // Initialize object symbols
   std::vector<ElfSym<E>> *esyms = new std::vector<ElfSym<E>>(1);
@@ -530,19 +564,54 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   return obj;
 }
 
+// This function restarts mold itself with `--:lto-pass2` and
+// `--:ignore-ir-file` flags. We do this as a workaround for the old
+// linker plugins that do not support the get_symbols_v3 API.
+//
+// get_symbols_v1 and get_symbols_v2 don't provide a way to ignore an
+// object file we previously passed to the linker plugin. So we can't
+// "unload" object files in archives that we ended up not choosing to
+// include into the final output.
+//
+// As a workaround, we restart the linker with a list of object files
+// the linker has to ignore, so that it won't read the object files
+// from archives next time.
+//
+// This is an ugly hack and should be removed once GCC adopts the v3 API.
+template <typename E>
+static void restart_process(Context<E> &ctx) {
+  std::vector<const char *> args;
+
+  for (std::string_view arg : ctx.cmdline_args)
+    args.push_back(strdup(std::string(arg).c_str()));
+
+  for (std::unique_ptr<ObjectFile<E>> &file : ctx.obj_pool)
+    if (file->is_lto_obj && !file->is_alive)
+      args.push_back(strdup(("--:ignore-ir-file=" +
+                             file->mf->get_identifier()).c_str()));
+
+  args.push_back("--:lto-pass2");
+  args.push_back(nullptr);
+
+  std::string self = std::filesystem::read_symlink("/proc/self/exe");
+
+  std::cout << std::flush;
+  std::cerr << std::flush;
+  execv(self.c_str(), (char * const *)args.data());
+  std::cerr << "execv failed: " << errno_string() << "\n";
+  _exit(1);
+}
+
 // Entry point
 template <typename E>
-void do_lto(Context<E> &ctx) {
+std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx) {
   Timer t(ctx, "do_lto");
+
+  if (!ctx.arg.lto_pass2 && !suppots_v3_api(ctx))
+    restart_process(ctx);
 
   assert(phase == 1);
   phase = 2;
-
-  // Compute import/export information early because `get_symbols`
-  // function needs them.
-  apply_version_script(ctx);
-  parse_symbol_version(ctx);
-  compute_import_export(ctx);
 
   // Set `referenced_by_regular_obj` bit.
   for (ObjectFile<E> *file : ctx.objs) {
@@ -563,14 +632,10 @@ void do_lto(Context<E> &ctx) {
 
   // all_symbols_read_hook() calls add_input_file() and add_input_library()
   LOG << "all symbols read\n";
-  all_symbols_read_hook();
+  if (PluginStatus st = all_symbols_read_hook(); st != LDPS_OK)
+    Fatal(ctx) << "LTO: all_symbols_read_hook returns " << st;
 
-  // Remove IR object files
-  for (ObjectFile<E> *file : ctx.objs)
-    if (file->is_lto_obj)
-      file->is_alive = false;
-
-  std::erase_if(ctx.objs, [](ObjectFile<E> *file) { return file->is_lto_obj; });
+  return lto_objects<E>;
 }
 
 template <typename E>
@@ -584,12 +649,13 @@ void lto_cleanup(Context<E> &ctx) {
 #define INSTANTIATE(E)                                                  \
   template ObjectFile<E> *                                              \
     read_lto_object(Context<E> &, MappedFile<Context<E>> *);            \
-  template void do_lto(Context<E> &);                                   \
+  template std::vector<ObjectFile<E> *> do_lto(Context<E> &);           \
   template void lto_cleanup(Context<E> &)
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(ARM32);
 INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

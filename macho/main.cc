@@ -23,7 +23,7 @@ split_string(std::string_view str, char sep) {
 template <typename E>
 static void create_internal_file(Context<E> &ctx) {
   ObjectFile<E> *obj = new ObjectFile<E>;
-  ctx.obj_pool.push_back(std::unique_ptr<ObjectFile<E>>(obj));
+  ctx.obj_pool.emplace_back(obj);
   ctx.objs.push_back(obj);
 
   auto add = [&](std::string_view name) {
@@ -474,6 +474,15 @@ static int do_main(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+  if (!getenv("MOLD_SUPPRESS_MACHO_WARNING")) {
+    std::cerr <<
+R"(********************************************************************************
+mold for macOS is pre-alpha. Do not use unless you know what you are doing.
+Do not report bugs because it's too early to manage missing features as bugs.
+********************************************************************************
+)";
+  }
+
   return do_main<ARM64>(argc, argv);
 }
 

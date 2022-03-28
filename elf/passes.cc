@@ -1,5 +1,6 @@
 #include "mold.h"
 
+#include <fstream>
 #include <functional>
 #include <map>
 #include <optional>
@@ -31,73 +32,57 @@ void apply_exclude_libs(Context<E> &ctx) {
 
 template <typename E>
 void create_synthetic_sections(Context<E> &ctx) {
-  auto add = [&](auto &chunk) {
-    ctx.chunks.push_back(chunk.get());
+  auto push = [&]<typename T>(T *x) {
+    ctx.chunks.push_back(x);
+    return std::unique_ptr<T>(x);
   };
 
-  add(ctx.ehdr = std::make_unique<OutputEhdr<E>>());
-  add(ctx.phdr = std::make_unique<OutputPhdr<E>>());
-  add(ctx.shdr = std::make_unique<OutputShdr<E>>());
-  add(ctx.got = std::make_unique<GotSection<E>>());
-  add(ctx.gotplt = std::make_unique<GotPltSection<E>>());
-  add(ctx.reldyn = std::make_unique<RelDynSection<E>>());
-  add(ctx.relplt = std::make_unique<RelPltSection<E>>());
+  ctx.ehdr = push(new OutputEhdr<E>);
+  ctx.phdr = push(new OutputPhdr<E>);
+  ctx.shdr = push(new OutputShdr<E>);
+  ctx.got = push(new GotSection<E>);
+  ctx.gotplt = push(new GotPltSection<E>);
+  ctx.reldyn = push(new RelDynSection<E>);
+  ctx.relplt = push(new RelPltSection<E>);
 
   if (ctx.arg.pack_dyn_relocs_relr)
-    add(ctx.relrdyn = std::make_unique<RelrDynSection<E>>());
+    ctx.relrdyn = push(new RelrDynSection<E>);
 
-  add(ctx.strtab = std::make_unique<StrtabSection<E>>());
-  add(ctx.shstrtab = std::make_unique<ShstrtabSection<E>>());
-  add(ctx.plt = std::make_unique<PltSection<E>>());
-  add(ctx.pltgot = std::make_unique<PltGotSection<E>>());
-  add(ctx.symtab = std::make_unique<SymtabSection<E>>());
-  add(ctx.dynsym = std::make_unique<DynsymSection<E>>());
-  add(ctx.dynstr = std::make_unique<DynstrSection<E>>());
-  add(ctx.eh_frame = std::make_unique<EhFrameSection<E>>());
-  add(ctx.copyrel = std::make_unique<CopyrelSection<E>>(false));
-  add(ctx.copyrel_relro = std::make_unique<CopyrelSection<E>>(true));
+  ctx.strtab = push(new StrtabSection<E>);
+  ctx.shstrtab = push(new ShstrtabSection<E>);
+  ctx.plt = push(new PltSection<E>);
+  ctx.pltgot = push(new PltGotSection<E>);
+  ctx.symtab = push(new SymtabSection<E>);
+  ctx.dynsym = push(new DynsymSection<E>);
+  ctx.dynstr = push(new DynstrSection<E>);
+  ctx.eh_frame = push(new EhFrameSection<E>);
+  ctx.copyrel = push(new CopyrelSection<E>(false));
+  ctx.copyrel_relro = push(new CopyrelSection<E>(true));
 
   if (!ctx.arg.dynamic_linker.empty())
-    add(ctx.interp = std::make_unique<InterpSection<E>>());
+    ctx.interp = push(new InterpSection<E>);
   if (ctx.arg.build_id.kind != BuildId::NONE)
-    add(ctx.buildid = std::make_unique<BuildIdSection<E>>());
+    ctx.buildid = push(new BuildIdSection<E>);
   if (ctx.arg.eh_frame_hdr)
-    add(ctx.eh_frame_hdr = std::make_unique<EhFrameHdrSection<E>>());
+    ctx.eh_frame_hdr = push(new EhFrameHdrSection<E>);
   if (ctx.arg.hash_style_sysv)
-    add(ctx.hash = std::make_unique<HashSection<E>>());
+    ctx.hash = push(new HashSection<E>);
   if (ctx.arg.hash_style_gnu)
-    add(ctx.gnu_hash = std::make_unique<GnuHashSection<E>>());
+    ctx.gnu_hash = push(new GnuHashSection<E>);
   if (!ctx.arg.version_definitions.empty())
-    add(ctx.verdef = std::make_unique<VerdefSection<E>>());
+    ctx.verdef = push(new VerdefSection<E>);
 
-  add(ctx.dynamic = std::make_unique<DynamicSection<E>>());
-  add(ctx.versym = std::make_unique<VersymSection<E>>());
-  add(ctx.verneed = std::make_unique<VerneedSection<E>>());
-  add(ctx.note_property = std::make_unique<NotePropertySection<E>>());
+  ctx.dynamic = push(new DynamicSection<E>);
+  ctx.versym = push(new VersymSection<E>);
+  ctx.verneed = push(new VerneedSection<E>);
+  ctx.note_property = push(new NotePropertySection<E>);
 }
 
 template <typename E>
-void resolve_symbols(Context<E> &ctx) {
-  Timer t(ctx, "resolve_symbols");
-
-  std::vector<InputFile<E> *> files;
-  append(files, ctx.objs);
-  append(files, ctx.dsos);
-
-  // Register symbols
-  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
-    file->resolve_symbols(ctx);
-  });
-
-  // Mark reachable objects to decide which files to include
-  // into an output.
-  std::vector<InputFile<E> *> live_set = files;
-  std::erase_if(live_set, [](InputFile<E> *file) { return !file->is_alive; });
-
+static void mark_live_objects(Context<E> &ctx) {
   auto mark_symbol = [&](std::string_view name) {
     if (InputFile<E> *file = get_symbol(ctx, name)->file)
-      if (!file->is_alive.exchange(true))
-        live_set.push_back(file);
+      file->is_alive = true;
   };
 
   for (std::string_view name : ctx.arg.undefined)
@@ -105,21 +90,49 @@ void resolve_symbols(Context<E> &ctx) {
   for (std::string_view name : ctx.arg.require_defined)
     mark_symbol(name);
 
-  tbb::parallel_for_each(live_set, [&](InputFile<E> *file,
-                                       tbb::feeder<InputFile<E> *> &feeder) {
-    file->mark_live_objects(ctx, [&](InputFile<E> *obj) { feeder.add(obj); });
+  std::vector<InputFile<E> *> roots;
+
+  for (InputFile<E> *file : ctx.objs)
+    if (file->is_alive)
+      roots.push_back(file);
+
+  for (InputFile<E> *file : ctx.dsos)
+    if (file->is_alive)
+      roots.push_back(file);
+
+  tbb::parallel_for_each(roots, [&](InputFile<E> *file,
+                                    tbb::feeder<InputFile<E> *> &feeder) {
+    if (file->is_alive)
+      file->mark_live_objects(ctx, [&](InputFile<E> *obj) { feeder.add(obj); });
   });
+}
+
+template <typename E>
+void do_resolve_symbols(Context<E> &ctx) {
+  Timer t(ctx, "do_resolve_symbols");
+
+  auto for_each_file = [&](std::function<void(InputFile<E> *)> fn) {
+    tbb::parallel_for_each(ctx.objs, fn);
+    tbb::parallel_for_each(ctx.dsos, fn);
+  };
+
+  // Register symbols
+  for_each_file([&](InputFile<E> *file) { file->resolve_symbols(ctx); });
+
+  // Mark reachable objects to decide which files to include into an output.
+  // This also merges symbol visibility.
+  mark_live_objects(ctx);
 
   // Remove symbols of eliminated files.
-  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
+  for_each_file([](InputFile<E> *file) {
     if (!file->is_alive)
-      file->clear_symbols(ctx);
+      file->clear_symbols();
   });
 
   // Since we have turned on object files live bits, their symbols
   // may now have higher priority than before. So run the symbol
   // resolution pass again to get the final resolution result.
-  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
+  for_each_file([&](InputFile<E> *file) {
     if (file->is_alive)
       file->resolve_symbols(ctx);
   });
@@ -127,6 +140,59 @@ void resolve_symbols(Context<E> &ctx) {
   // Remove unused files
   std::erase_if(ctx.objs, [](InputFile<E> *file) { return !file->is_alive; });
   std::erase_if(ctx.dsos, [](InputFile<E> *file) { return !file->is_alive; });
+}
+
+template <typename E>
+void resolve_symbols(Context<E> &ctx) {
+  Timer t(ctx, "do_resolve_symbols");
+
+  std::vector<ObjectFile<E> *> objs = ctx.objs;
+  std::vector<SharedFile<E> *> dsos = ctx.dsos;
+
+  do_resolve_symbols(ctx);
+
+  if (ctx.has_lto_object) {
+    // Do link-time optimization. We pass all IR object files to the
+    // compiler backend to compile them into a few ELF object files.
+    //
+    // The compiler backend needs to know how symbols are resolved,
+    // so compute symbol visibility, import/export bits, etc early.
+    mark_live_objects(ctx);
+    apply_version_script(ctx);
+    parse_symbol_version(ctx);
+    compute_import_export(ctx);
+
+    // Do LTO. It compiles IR object files into a few big ELF files.
+    std::vector<ObjectFile<E> *> lto_objs = do_lto(ctx);
+
+    // do_resolve_symbols() have removed unreferenced files. Restore the
+    // original files here because some of them may have to be resurrected
+    // because they are referenced by the ELF files returned from do_lto().
+    ctx.objs = objs;
+    ctx.dsos = dsos;
+
+    append(ctx.objs, lto_objs);
+
+    // Remove IR object files.
+    for (ObjectFile<E> *file : ctx.objs)
+      if (file->is_lto_obj)
+        file->is_alive = false;
+
+    std::erase_if(ctx.objs, [](ObjectFile<E> *file) { return file->is_lto_obj; });
+
+    // Redo name resolution from scratch.
+    tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+      file->clear_symbols();
+      file->is_alive = !file->is_in_lib;
+    });
+
+    tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
+      file->clear_symbols();
+      file->is_alive = true;
+    });
+
+    do_resolve_symbols(ctx);
+  }
 }
 
 template <typename E>
@@ -264,26 +330,12 @@ void bin_sections(Context<E> &ctx) {
   });
 }
 
-static std::optional<u64> parse_defsym_addr(std::string_view s) {
-  if (s.starts_with("0x") || s.starts_with("0X")) {
-    size_t nread;
-    u64 addr = std::stoull(std::string(s), &nread, 16);
-    if (s.size() != nread)
-      return {};
-    return addr;
-  }
-
-  if (s.find_first_not_of("0123456789") == s.npos)
-    return std::stoull(std::string(s), nullptr, 10);
-  return {};
-}
-
 // Create a dummy object file containing linker-synthesized
 // symbols.
 template <typename E>
 ObjectFile<E> *create_internal_file(Context<E> &ctx) {
   ObjectFile<E> *obj = new ObjectFile<E>;
-  ctx.obj_pool.push_back(std::unique_ptr<ObjectFile<E>>(obj));
+  ctx.obj_pool.emplace_back(obj);
 
   // Create linker-synthesized symbols.
   auto *esyms = new std::vector<ElfSym<E>>(1);
@@ -302,7 +354,6 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
     esyms->push_back(esym);
 
     Symbol<E> *sym = get_symbol(ctx, name);
-    sym->shndx = 1; // dummy value to make it a relative symbol
     obj->symbols.push_back(sym);
     return sym;
   };
@@ -348,17 +399,16 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
     add(save_string(ctx, "__stop_" + std::string(chunk->name)));
   }
 
-  for (std::pair<std::string_view, std::string_view> pair : ctx.arg.defsyms) {
+  i64 first_defsym = obj->symbols.size();
+
+  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
+    Symbol<E> *sym = ctx.arg.defsyms[i].first;
     ElfSym<E> esym = {};
     esym.st_type = STT_NOTYPE;
     esym.st_shndx = SHN_ABS;
     esym.st_bind = STB_GLOBAL;
     esym.st_visibility = STV_DEFAULT;
     esyms->push_back(esym);
-
-    Symbol<E> *sym = get_symbol(ctx, pair.first);
-    if (!parse_defsym_addr(pair.second))
-      sym->shndx = 1; // dummy value to make it a relative symbol
     obj->symbols.push_back(sym);
   };
 
@@ -367,6 +417,20 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
 
   i64 num_globals = obj->elf_syms.size() - obj->first_global;
   obj->symvers.resize(num_globals);
+
+  obj->resolve_symbols(ctx);
+
+  for (i64 i = obj->first_global; i < first_defsym; i++)
+    obj->symbols[i]->shndx = -1; // dummy value to make it a relative symbol
+
+  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
+    Symbol<E> *sym = ctx.arg.defsyms[i].first;
+    std::variant<Symbol<E> *, u64> val = ctx.arg.defsyms[i].second;
+
+    if (Symbol<E> **sym2 = std::get_if<Symbol<E> *>(&val))
+      if ((*sym2)->is_relative())
+        sym->shndx = -1; // dummy value to make it a relative symbol
+  }
 
   ctx.on_exit.push_back([=] {
     delete esyms;
@@ -408,9 +472,9 @@ void print_dependencies(Context<E> &ctx) {
   SyncOut(ctx) <<
 R"(# This is an output of the mold linker's --print-dependencies option.
 #
-# Each line consists of three fields, <input-file>, <output-file> and
-# <symbol> separated by tab characters. It indicates that <input-file>
-# depends on <output-file> to use <symbol>.)";
+# Each line consists of three fields, <file1>, <file2> and <symbol>
+# separated by tab characters. It indicates that <file1> depends on
+# <file2> to use <symbol>.)";
 
   auto print = [&](InputFile<E> *file) {
     for (i64 i = file->first_global; i < file->symbols.size(); i++) {
@@ -432,17 +496,17 @@ void print_dependencies_full(Context<E> &ctx) {
   SyncOut(ctx) <<
 R"(# This is an output of the mold linker's --print-dependencies=full option.
 #
-# Each line consists of 4 fields, <input-section>, <output-section>,
-# <symbol-type> and <symbol>, separated by tab characters. It indicates that
-# <input-section> depends on <output-section> to use <symbol>. <symbol-type>
-# is either "u" or "w" for regular or weak undefined, respectively.
+# Each line consists of 4 fields, <section1>, <section2>, <symbol-type> and
+# <symbol>, separated by tab characters. It indicates that <section1> depends
+# on <section2> to use <symbol>. <symbol-type> is either "u" or "w" for
+# regular undefined or weak undefined, respectively.
 #
 # If you want to obtain dependency information per function granularity,
 # compile source files with the -ffunction-sections compiler flag.)";
 
   auto println = [&](auto &src, Symbol<E> &sym, ElfSym<E> &esym) {
-    if (sym.input_section)
-      SyncOut(ctx) << src << "\t" << *sym.input_section
+    if (InputSection<E> *isec = sym.get_input_section())
+      SyncOut(ctx) << src << "\t" << *isec
                    << "\t" << (esym.is_weak() ? 'w' : 'u')
                    << "\t" << sym;
     else
@@ -570,6 +634,9 @@ void sort_init_fini(Context<E> &ctx) {
 
   for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections) {
     if (osec->name == ".init_array" || osec->name == ".fini_array") {
+      if (ctx.arg.shuffle_sections == SHUFFLE_SECTIONS_REVERSE)
+        std::reverse(osec->members.begin(), osec->members.end());
+
       sort(osec->members, [&](InputSection<E> *a, InputSection<E> *b) {
         return get_priority(a) < get_priority(b);
       });
@@ -607,14 +674,36 @@ template <typename E>
 void shuffle_sections(Context<E> &ctx) {
   Timer t(ctx, "shuffle_sections");
 
-  u64 seed = std::random_device()();
+  auto is_eligible = [](OutputSection<E> &osec) {
+    return osec.name != ".init" && osec.name != ".fini" &&
+           osec.name != ".init_array" && osec.name != ".fini_array";
+  };
 
-  tbb::parallel_for_each(ctx.output_sections,
-                         [&](std::unique_ptr<OutputSection<E>> &osec) {
-    if (osec->name != ".init" && osec->name != ".fini" &&
-        osec->name != ".init_array" && osec->name != ".fini_array")
-      shuffle(osec->members, seed + hash_string(osec->name));
-  });
+  switch (ctx.arg.shuffle_sections) {
+  case SHUFFLE_SECTIONS_NONE:
+    unreachable();
+  case SHUFFLE_SECTIONS_SHUFFLE: {
+    u64 seed;
+    if (ctx.arg.shuffle_sections_seed)
+      seed = *ctx.arg.shuffle_sections_seed;
+    else
+      seed = std::random_device()();
+
+    tbb::parallel_for_each(ctx.output_sections,
+                           [&](std::unique_ptr<OutputSection<E>> &osec) {
+      if (is_eligible(*osec))
+        shuffle(osec->members, seed + hash_string(osec->name));
+    });
+    break;
+  }
+  case SHUFFLE_SECTIONS_REVERSE:
+    tbb::parallel_for_each(ctx.output_sections,
+                           [&](std::unique_ptr<OutputSection<E>> &osec) {
+      if (is_eligible(*osec))
+        std::reverse(osec->members.begin(), osec->members.end());
+    });
+    break;
+  }
 }
 
 template <typename E>
@@ -820,7 +909,7 @@ void create_reloc_sections(Context<E> &ctx) {
   for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections) {
     RelocSection<E> *r = new RelocSection<E>(ctx, *osec);
     ctx.chunks.push_back(r);
-    ctx.output_chunks.push_back(std::unique_ptr<Chunk<E>>(r));
+    ctx.output_chunks.emplace_back(r);
   }
 
   // Create a table to map input symbol indices to output symbol indices
@@ -1155,45 +1244,58 @@ template <typename E>
 void fix_synthetic_symbols(Context<E> &ctx) {
   auto start = [](Symbol<E> *sym, auto &chunk) {
     if (sym && chunk) {
-      sym->shndx = chunk->shndx;
+      sym->shndx = -chunk->shndx;
       sym->value = chunk->shdr.sh_addr;
     }
   };
 
   auto stop = [](Symbol<E> *sym, auto &chunk) {
     if (sym && chunk) {
-      sym->shndx = chunk->shndx;
+      sym->shndx = -chunk->shndx;
       sym->value = chunk->shdr.sh_addr + chunk->shdr.sh_size;
     }
   };
 
+  auto find = [&](std::string name) -> Chunk<E> * {
+    for (Chunk<E> *chunk : ctx.chunks)
+      if (chunk->name == name)
+        return chunk;
+    return nullptr;
+  };
+
   // __bss_start
-  for (Chunk<E> *chunk : ctx.chunks) {
-    if (chunk->is_output_section() && chunk->name == ".bss") {
-      start(ctx.__bss_start, chunk);
-      break;
-    }
-  }
+  if (Chunk<E> *chunk = find(".bss"))
+    start(ctx.__bss_start, chunk);
 
   // __ehdr_start and __executable_start
   for (Chunk<E> *chunk : ctx.chunks) {
     if (chunk->shndx == 1) {
-      ctx.__ehdr_start->shndx = 1;
+      ctx.__ehdr_start->shndx = -1;
       ctx.__ehdr_start->value = ctx.ehdr->shdr.sh_addr;
 
-      ctx.__executable_start->shndx = 1;
+      ctx.__executable_start->shndx = -1;
       ctx.__executable_start->value = ctx.ehdr->shdr.sh_addr;
       break;
     }
   }
 
-  // __rel_iplt_start
-  start(ctx.__rel_iplt_start, ctx.reldyn);
+  // __rel_iplt_start and __rel_iplt_end. These symbols need to be
+  // defined in a statically-linked non-relocatable executable because
+  // such executable lacks the .dynamic section and thus there's no way
+  // to find ifunc relocations other than these symbols.
+  //
+  // We don't want to set values to these symbols if we are creating a
+  // static PIE due to a glibc bug. If we set values to these symbols in
+  // a static PIE, glibc attempts to run ifunc initializers twice, with
+  // the second attempt with wrong function addresses, causing a
+  // segmentation fault.
+  if (ctx.reldyn && ctx.arg.is_static && !ctx.arg.pie) {
+    stop(ctx.__rel_iplt_start, ctx.reldyn);
+    stop(ctx.__rel_iplt_end, ctx.reldyn);
 
-  // __rel_iplt_end
-  ctx.__rel_iplt_end->shndx = ctx.reldyn->shndx;
-  ctx.__rel_iplt_end->value = ctx.reldyn->shdr.sh_addr +
-    get_num_irelative_relocs(ctx) * sizeof(ElfRel<E>);
+    ctx.__rel_iplt_start->value -=
+      get_num_irelative_relocs(ctx) * sizeof(ElfRel<E>);
+  }
 
   // __{init,fini}_array_{start,end}
   for (Chunk<E> *chunk : ctx.chunks) {
@@ -1235,12 +1337,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   start(ctx._DYNAMIC, ctx.dynamic);
 
   // _GLOBAL_OFFSET_TABLE_
-  if (E::e_machine == EM_X86_64 || E::e_machine == EM_386)
-    start(ctx._GLOBAL_OFFSET_TABLE_, ctx.gotplt);
-  else if (E::e_machine == EM_AARCH64 || E::e_machine == EM_RISCV)
-    start(ctx._GLOBAL_OFFSET_TABLE_, ctx.got);
-  else
-    unreachable();
+  start(ctx._GLOBAL_OFFSET_TABLE_, ctx.got);
 
   // __GNU_EH_FRAME_HDR
   start(ctx.__GNU_EH_FRAME_HDR, ctx.eh_frame_hdr);
@@ -1250,12 +1347,8 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     ctx.__global_pointer->shndx = 1;
     ctx.__global_pointer->value = 0x800;
 
-    for (Chunk<E> *chunk : ctx.chunks) {
-      if (chunk->name == ".sdata") {
-        ctx.__global_pointer->shndx = chunk->shndx;
-        break;
-      }
-    }
+    if (Chunk<E> *chunk = find(".sdata"))
+      ctx.__global_pointer->shndx = -chunk->shndx;
   }
 
   // __start_ and __stop_ symbols
@@ -1272,16 +1365,18 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   }
 
   // --defsym=sym=value symbols
-  for (std::pair<std::string_view, std::string_view> defsym : ctx.arg.defsyms) {
-    Symbol<E> *sym = get_symbol(ctx, defsym.first);
-    sym->input_section = nullptr;
+  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
+    Symbol<E> *sym = ctx.arg.defsyms[i].first;
+    std::variant<Symbol<E> *, u64> val = ctx.arg.defsyms[i].second;
 
-    if (std::optional<u64> addr = parse_defsym_addr(defsym.second)) {
+    sym->shndx = 0;
+
+    if (u64 *addr = std::get_if<u64>(&val)) {
       sym->value = *addr;
       continue;
     }
 
-    Symbol<E> *sym2 = get_symbol(ctx, defsym.second);
+    Symbol<E> *sym2 = std::get<Symbol<E> *>(val);
     if (!sym2->file) {
       Error(ctx) << "--defsym: undefined symbol: " << *sym2;
       continue;
@@ -1290,13 +1385,13 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     sym->value = sym2->get_addr(ctx);
     sym->visibility = sym2->visibility.load();
 
-    if (InputSection<E> *isec = sym2->input_section)
-      sym->shndx = isec->output_section->shndx;
+    if (InputSection<E> *isec = sym2->get_input_section())
+      sym->shndx = -isec->output_section->shndx;
   }
 }
 
 template <typename E>
-void compress_debug_sections(Context<E> &ctx) {
+i64 compress_debug_sections(Context<E> &ctx) {
   Timer t(ctx, "compress_debug_sections");
 
   tbb::parallel_for((i64)0, (i64)ctx.chunks.size(), [&](i64 i) {
@@ -1313,13 +1408,42 @@ void compress_debug_sections(Context<E> &ctx) {
       comp = new GnuCompressedSection<E>(ctx, chunk);
     assert(comp);
 
-    ctx.output_chunks.push_back(std::unique_ptr<Chunk<E>>(comp));
+    ctx.output_chunks.emplace_back(comp);
     ctx.chunks[i] = comp;
   });
 
   ctx.shstrtab->update_shdr(ctx);
   ctx.ehdr->update_shdr(ctx);
   ctx.shdr->update_shdr(ctx);
+  return set_osec_offsets(ctx);
+}
+
+// Write Makefile-style dependency rules to a file specified by
+// --dependency-file. This is analogous to the compiler's -M flag.
+template <typename E>
+void write_dependency_file(Context<E> &ctx) {
+  std::vector<std::string> deps;
+  std::unordered_set<std::string> seen;
+
+  for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool)
+    if (!mf->parent)
+      if (std::string path = path_clean(mf->name); seen.insert(path).second)
+        deps.push_back(path);
+
+  std::ofstream out;
+  out.open(ctx.arg.dependency_file);
+  if (out.fail())
+    Fatal(ctx) << "--dependency-file: cannot open " << ctx.arg.dependency_file
+               << ": " << errno_string();
+
+  out << ctx.arg.output << ":";
+  for (std::string &s : deps)
+    out << " " << s;
+  out << "\n";
+
+  for (std::string &s : deps)
+    out << "\n" << s << ":\n";
+  out.close();
 }
 
 #define INSTANTIATE(E)                                                  \
@@ -1353,11 +1477,13 @@ void compress_debug_sections(Context<E> &ctx) {
   template i64 get_section_rank(Context<E> &, Chunk<E> *);              \
   template i64 set_osec_offsets(Context<E> &);                          \
   template void fix_synthetic_symbols(Context<E> &);                    \
-  template void compress_debug_sections(Context<E> &);
+  template i64 compress_debug_sections(Context<E> &);                   \
+  template void write_dependency_file(Context<E> &);
 
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(ARM32);
 INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

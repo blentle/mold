@@ -1,5 +1,5 @@
 #!/bin/bash
-export LANG=
+export LC_ALL=C
 set -e
 CC="${CC:-cc}"
 CXX="${CXX:-c++}"
@@ -13,7 +13,6 @@ mkdir -p $t
 cat <<EOF | $CC -c -o $t/a.o -x assembler -
 .globl _start
 _start:
-  ret
 EOF
 
 "$mold" -o $t/exe $t/a.o

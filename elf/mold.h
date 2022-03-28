@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #define XXH_INLINE_ALL 1
@@ -185,43 +186,27 @@ struct FdeRecord {
     : input_offset(input_offset), rel_idx(rel_idx) {}
 
   FdeRecord(const FdeRecord &other)
-    : cie(other.cie), input_offset(other.input_offset),
-      output_offset(other.output_offset), rel_idx(other.rel_idx),
+    : input_offset(other.input_offset), output_offset(other.output_offset),
+      rel_idx(other.rel_idx), cie_idx(other.cie_idx),
       is_alive(other.is_alive.load()) {}
 
   FdeRecord &operator=(const FdeRecord<E> &other) {
-    cie = other.cie;
     input_offset = other.input_offset;
     output_offset = other.output_offset;
     rel_idx = other.rel_idx;
+    cie_idx = other.cie_idx;
     is_alive = other.is_alive.load();
     return *this;
   }
 
-  i64 size() const {
-    return *(u32 *)(cie->contents.data() + input_offset) + 4;
-  }
-
-  std::string_view get_contents() const {
-    return cie->contents.substr(input_offset, size());
-  }
-
-  std::span<ElfRel<E>> get_rels() const {
-    std::span<ElfRel<E>> rels = cie->rels;
-    i64 end = rel_idx;
-    while (end < rels.size() && rels[end].r_offset < input_offset + size())
-      end++;
-    return rels.subspan(rel_idx, end - rel_idx);
-  }
-
-  union {
-    CieRecord<E> *cie = nullptr;
-    u32 cie_idx;
-  };
+  i64 size(ObjectFile<E> &file) const;
+  std::string_view get_contents(ObjectFile<E> &file) const;
+  std::span<ElfRel<E>> get_rels(ObjectFile<E> &file) const;
 
   u32 input_offset = -1;
   u32 output_offset = -1;
   u32 rel_idx = -1;
+  u16 cie_idx = -1;
   std::atomic_bool is_alive = true;
 };
 
@@ -254,12 +239,31 @@ struct RangeExtensionRef {
   i32 sym_idx = -1;
 };
 
+template <typename E>
+struct InputSectionExtra {
+  InputSectionExtra() = default;
+
+  InputSectionExtra(const InputSectionExtra &other)
+    : is_visited(other.is_visited.load()), leader(other.leader),
+      icf_idx(other.icf_idx), icf_eligible(other.icf_eligible),
+      icf_leaf(other.icf_leaf) {}
+
+  // For garbage collection
+  std::atomic_bool is_visited = false;
+
+  // For ICF
+  InputSection<E> *leader = nullptr;
+  u32 icf_idx = -1;
+  bool icf_eligible = false;
+  bool icf_leaf = false;
+};
+
 // InputSection represents a section in an input object file.
 template <typename E>
 class InputSection {
 public:
   InputSection(Context<E> &ctx, ObjectFile<E> &file, std::string_view name,
-               i64 section_idx);
+               i64 shndx);
 
   bool is_compressed();
   void uncompress(Context<E> &ctx, u8 *buf);
@@ -269,10 +273,8 @@ public:
   void apply_reloc_nonalloc(Context<E> &ctx, u8 *base);
   void kill();
 
-  std::string_view name() const {
-    return {nameptr, (size_t)namelen};
-  }
-
+  std::string_view name() const;
+  InputSectionExtra<E> &extra() const;
   i64 get_priority() const;
   u64 get_addr() const;
   i64 get_addend(const ElfRel<E> &rel) const;
@@ -285,7 +287,7 @@ public:
 
   // For RISC-V section resizing
   std::vector<i32> &get_r_deltas() const;
-  std::vector<Symbol<E> *> &get_sorted_symbols() const;
+  std::span<Symbol<E> *> get_sorted_symbols() const;
 
   ObjectFile<E> &file;
   OutputSection<E> *output_section = nullptr;
@@ -293,16 +295,11 @@ public:
   std::string_view contents;
 
   std::unique_ptr<SectionFragmentRef<E>[]> rel_fragments;
-  BitVector needs_dynrel;
-  BitVector needs_baserel;
   i32 fde_begin = -1;
   i32 fde_end = -1;
 
-  const char *nameptr = nullptr;
-  i32 namelen = 0;
-
   u32 offset = -1;
-  u32 section_idx = -1;
+  u32 shndx = -1;
   u32 relsec_idx = -1;
   u32 reldyn_offset = 0;
   u32 sh_size = -1;
@@ -310,16 +307,6 @@ public:
   // For COMDAT de-duplication and garbage collection
   std::atomic_bool is_alive = true;
 
-  // For garbage collection
-  std::atomic_bool is_visited = false;
-
-  // For ICF
-  InputSection *leader = nullptr;
-  u32 icf_idx = -1;
-  bool icf_eligible = false;
-  bool icf_leaf = false;
-
-  bool is_ehframe = false;
   u8 p2align = 0;
 
 private:
@@ -453,6 +440,14 @@ private:
 };
 
 template <typename E>
+struct GotEntry {
+  i64 idx = 0;
+  u64 val = 0;
+  i64 r_type = 0;
+  Symbol<E> *sym = nullptr;
+};
+
+template <typename E>
 class GotSection : public Chunk<E> {
 public:
   GotSection() {
@@ -480,6 +475,9 @@ public:
 
   void construct_relr(Context<E> &ctx);
   std::vector<typename E::WordTy> relr;
+
+private:
+  std::vector<GotEntry<E>> get_entries(Context<E> &ctx) const;
 };
 
 template <typename E>
@@ -965,7 +963,7 @@ public:
   ElfShdr<E> *find_section(i64 type);
 
   virtual void resolve_symbols(Context<E> &ctx) = 0;
-  virtual void clear_symbols(Context<E> &ctx);
+  virtual void clear_symbols();
 
   virtual void
   mark_live_objects(Context<E> &ctx,
@@ -1004,8 +1002,7 @@ protected:
 template <typename E>
 class ObjectFile : public InputFile<E> {
 public:
-  ObjectFile();
-  ~ObjectFile() = default;
+  ObjectFile() = default;
 
   static ObjectFile<E> *create(Context<E> &ctx, MappedFile<Context<E>> *mf,
                                std::string archive_name, bool is_in_lib);
@@ -1029,6 +1026,7 @@ public:
 
   std::string archive_name;
   std::vector<std::unique_ptr<InputSection<E>>> sections;
+  std::vector<InputSectionExtra<E>> extras;
   std::vector<std::unique_ptr<MergeableSection<E>>> mergeable_sections;
   bool is_in_lib = false;
   std::vector<ElfShdr<E>> elf_sections2;
@@ -1075,7 +1073,7 @@ private:
   uncompress_contents(Context<E> &ctx, const ElfShdr<E> &shdr,
                       std::string_view name);
 
-  bool has_common_symbol;
+  bool has_common_symbol = false;
 
   std::string_view symbol_strtab;
   const ElfShdr<E> *symtab_sec;
@@ -1087,8 +1085,6 @@ template <typename E>
 class SharedFile : public InputFile<E> {
 public:
   static SharedFile<E> *create(Context<E> &ctx, MappedFile<Context<E>> *mf);
-
-  ~SharedFile() = default;
 
   void parse(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx) override;
@@ -1195,7 +1191,7 @@ template <typename E>
 ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mb);
 
 template <typename E>
-void do_lto(Context<E> &ctx);
+std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx);
 
 template <typename E>
 void lto_cleanup(Context<E> &ctx);
@@ -1297,7 +1293,8 @@ template <typename E> void clear_padding(Context<E> &);
 template <typename E> i64 get_section_rank(Context<E> &, Chunk<E> *chunk);
 template <typename E> i64 set_osec_offsets(Context<E> &);
 template <typename E> void fix_synthetic_symbols(Context<E> &);
-template <typename E> void compress_debug_sections(Context<E> &);
+template <typename E> i64 compress_debug_sections(Context<E> &);
+template <typename E> void write_dependency_file(Context<E> &);
 
 //
 // arch-arm64.cc
@@ -1323,7 +1320,7 @@ public:
   open(Context<E> &ctx, std::string path, i64 filesize, i64 perm);
 
   virtual void close(Context<E> &ctx) = 0;
-  virtual ~OutputFile() {}
+  virtual ~OutputFile() = default;
 
   u8 *buf = nullptr;
   std::string path;
@@ -1368,6 +1365,12 @@ typedef enum {
   CET_REPORT_WARNING,
   CET_REPORT_ERROR,
 } CetReportKind;
+
+typedef enum {
+  SHUFFLE_SECTIONS_NONE,
+  SHUFFLE_SECTIONS_SHUFFLE,
+  SHUFFLE_SECTIONS_REVERSE,
+} ShuffleSectionsKind;
 
 struct VersionPattern {
   std::string_view pattern;
@@ -1422,6 +1425,7 @@ struct Context {
     CetReportKind z_cet_report = CET_REPORT_NONE;
     CompressKind compress_debug_sections = COMPRESS_NONE;
     SeparateCodeKind z_separate_code = SEPARATE_LOADABLE_SEGMENTS;
+    ShuffleSectionsKind shuffle_sections = SHUFFLE_SECTIONS_NONE;
     UnresolvedKind unresolved_symbols = UNRESOLVED_ERROR;
     bool Bsymbolic = false;
     bool Bsymbolic_functions = false;
@@ -1441,6 +1445,8 @@ struct Context {
     bool hash_style_sysv = true;
     bool icf = false;
     bool is_static = false;
+    bool lto_pass2 = false;
+    bool noinhibit_exec = false;
     bool omagic = false;
     bool pack_dyn_relocs_relr = false;
     bool perf = false;
@@ -1455,7 +1461,6 @@ struct Context {
     bool relocatable = false;
     bool repro = false;
     bool shared = false;
-    bool shuffle_sections = false;
     bool stats = false;
     bool strip_all = false;
     bool strip_debug = false;
@@ -1486,8 +1491,10 @@ struct Context {
     i64 spare_dynamic_tags = 5;
     i64 thread_count = 0;
     std::optional<GlobPattern> unique;
+    std::optional<u64> shuffle_sections_seed;
     std::string Map;
     std::string chroot;
+    std::string dependency_file;
     std::string directory;
     std::string dynamic_linker;
     std::string entry = "_start";
@@ -1499,14 +1506,15 @@ struct Context {
     std::string soname;
     std::string sysroot;
     std::unique_ptr<std::unordered_set<std::string_view>> retain_symbols_file;
+    std::unordered_set<std::string_view> ignore_ir_file;
     std::unordered_set<std::string_view> wrap;
-    std::vector<std::pair<std::string_view, std::string_view>> defsyms;
+    std::vector<std::pair<Symbol<E> *, std::variant<Symbol<E> *, u64>>> defsyms;
     std::vector<std::string> library_paths;
+    std::vector<std::string> plugin_opt;
     std::vector<std::string> version_definitions;
     std::vector<std::string_view> auxiliary;
     std::vector<std::string_view> exclude_libs;
     std::vector<std::string_view> filter;
-    std::vector<std::string_view> plugin_opt;
     std::vector<std::string_view> require_defined;
     std::vector<std::string_view> trace_symbol;
     std::vector<std::string_view> undefined;
@@ -1689,8 +1697,6 @@ public:
   Symbol(std::string_view name) : nameptr(name.data()), namelen(name.size()) {}
   Symbol(const Symbol<E> &other) : Symbol(other.name()) {}
 
-  bool operator<(const Symbol &other) const;
-
   u64 get_addr(Context<E> &ctx, bool allow_plt = true) const;
   u64 get_got_addr(Context<E> &ctx) const;
   u64 get_gotplt_addr(Context<E> &ctx) const;
@@ -1723,6 +1729,7 @@ public:
   bool is_absolute() const;
   bool is_relative() const;
 
+  InputSection<E> *get_input_section() const;
   u32 get_type() const;
   std::string_view get_version() const;
   const ElfSym<E> &esym() const;
@@ -1734,17 +1741,20 @@ public:
   // If `file` is null, the symbol is equivalent to nonexistent.
   InputFile<E> *file = nullptr;
 
-  InputSection<E> *input_section = nullptr;
-  const char *nameptr = nullptr;
-
   u64 value = 0;
 
-  // Index into the symbol table of the owner file.
-  i32 sym_idx = -1;
+  const char *nameptr = nullptr;
+  u64 namelen : 20 = 0;
 
-  i32 namelen = 0;
+  // Index into the symbol table of the owner file.
+  i64 sym_idx : 20 = -1;
+
+  // shndx > 0  : symbol is in file's shndx'th section
+  // shndx == 0 : absolute symbol
+  // shndx < 0  : symbol is in the -shndx'th output section
+  i64 shndx : 20 = 0;
+
   i32 aux_idx = -1;
-  u16 shndx = 0;
   u16 ver_idx = 0;
 
   // `flags` has NEEDS_ flags.
@@ -1789,7 +1799,7 @@ public:
   u8 referenced_by_regular_obj : 1 = false;
 
   // Target-dependent extra members.
-  SymbolExtras<E> extra;
+  [[no_unique_address]] SymbolExtras<E> extra;
 };
 
 // If we haven't seen the same `key` before, create a new instance
@@ -1822,6 +1832,25 @@ std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym) {
 //
 
 template <typename E>
+inline i64 FdeRecord<E>::size(ObjectFile<E> &file) const {
+  return *(u32 *)(file.cies[cie_idx].contents.data() + input_offset) + 4;
+}
+
+template <typename E>
+inline std::string_view FdeRecord<E>::get_contents(ObjectFile<E> &file) const {
+  return file.cies[cie_idx].contents.substr(input_offset, size(file));
+}
+
+template <typename E>
+inline std::span<ElfRel<E>> FdeRecord<E>::get_rels(ObjectFile<E> &file) const {
+  std::span<ElfRel<E>> rels = file.cies[cie_idx].rels;
+  i64 end = rel_idx;
+  while (end < rels.size() && rels[end].r_offset < input_offset + size(file))
+    end++;
+  return rels.subspan(rel_idx, end - rel_idx);
+}
+
+template <typename E>
 inline std::ostream &
 operator<<(std::ostream &out, const InputSection<E> &isec) {
   out << isec.file << ":(" << isec.name() << ")";
@@ -1846,8 +1875,20 @@ inline u64 InputSection<E>::get_addr() const {
 }
 
 template <typename E>
+inline std::string_view InputSection<E>::name() const {
+  if (file.elf_sections.size() <= shndx)
+    return ".common";
+  return file.shstrtab.data() + file.elf_sections[shndx].sh_name;
+}
+
+template <typename E>
 inline i64 InputSection<E>::get_priority() const {
-  return ((i64)file.priority << 32) | section_idx;
+  return ((i64)file.priority << 32) | shndx;
+}
+
+template <typename E>
+inline InputSectionExtra<E> &InputSection<E>::extra() const {
+  return file.extras[shndx];
 }
 
 template <typename E>
@@ -1888,19 +1929,77 @@ inline i64 InputSection<I386>::get_addend(const ElfRel<I386> &rel) const {
   unreachable();
 }
 
+template <>
+inline i64 InputSection<ARM32>::get_addend(const ElfRel<ARM32> &rel) const {
+  u8 *loc = (u8 *)contents.data() + rel.r_offset;
+
+  auto bit = [](u32 val, i64 pos) -> i32 {
+    return (val >> pos) & 1;
+  };
+
+  // Returns [hi:lo] bits of val.
+  auto bits = [](u64 val, i64 hi, i64 lo) -> i32 {
+    return (val >> lo) & (((u64)1 << (hi - lo + 1)) - 1);
+  };
+
+  auto sign_extend = [](u64 val, i64 size) -> i32 {
+    return (i64)(val << (63 - size)) >> (63 - size);
+  };
+
+  auto read_thm_mov_imm = [&]() -> i32 {
+    u32 imm4 = bits(*(u16 *)loc, 3, 0);
+    u32 i = bit(*(u16 *)loc, 10);
+    u32 imm3 = bits(*(u16 *)(loc + 2), 14, 12);
+    u32 imm8 = bits(*(u16 *)(loc + 2), 7, 0);
+    return (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
+  };
+
+  switch (rel.r_type) {
+  case R_ARM_NONE:
+    return 0;
+  case R_ARM_ABS32:
+  case R_ARM_REL32:
+    return *(i32 *)loc;
+  case R_ARM_THM_CALL: {
+    u32 S = bit(*(u16 *)loc, 10);
+    u32 J1 = bit(*(u16 *)(loc + 2), 13);
+    u32 J2 = bit(*(u16 *)(loc + 2), 11);
+    u32 I1 = !(J1 ^ S);
+    u32 I2 = !(J2 ^ S);
+    u32 imm10 = bits(*(u16 *)loc, 9, 0);
+    u32 imm11 = bits(*(u16 *)(loc + 2), 10, 0);
+    u32 val = (S << 24) | (I1 << 23) | (I2 << 22) | (imm10 << 12) | (imm11 << 1);
+    return sign_extend(val, 24);
+  }
+  case R_ARM_BASE_PREL:
+  case R_ARM_GOT_BREL:
+    return *(i32 *)loc;
+  case R_ARM_CALL:
+  case R_ARM_JUMP24:
+    return sign_extend(*(u32 *)loc & 0x00ff'ffff, 23) << 2;
+  case R_ARM_PREL31:
+    return sign_extend(*(u32 *)loc, 30);
+  case R_ARM_THM_MOVW_ABS_NC:
+    return read_thm_mov_imm();
+  case R_ARM_THM_MOVT_ABS:
+    return read_thm_mov_imm() << 16;
+  }
+  unreachable();
+}
+
 template <typename E>
 inline const ElfShdr<E> &InputSection<E>::shdr() const {
-  if (section_idx < file.elf_sections.size())
-    return file.elf_sections[section_idx];
-  return file.elf_sections2[section_idx - file.elf_sections.size()];
+  if (shndx < file.elf_sections.size())
+    return file.elf_sections[shndx];
+  return file.elf_sections2[shndx - file.elf_sections.size()];
 }
 
 template <typename E>
 inline std::span<ElfRel<E>> InputSection<E>::get_rels(Context<E> &ctx) const {
   if (relsec_idx == -1)
     return {};
-  if (!file.sorted_rels.empty() && !file.sorted_rels[section_idx].empty())
-    return file.sorted_rels[section_idx];
+  if (!file.sorted_rels.empty() && !file.sorted_rels[shndx].empty())
+    return file.sorted_rels[shndx];
   return file.template get_data<ElfRel<E>>(ctx, file.elf_sections[relsec_idx]);
 }
 
@@ -1914,17 +2013,17 @@ inline std::span<FdeRecord<E>> InputSection<E>::get_fdes() const {
 
 template <typename E>
 inline std::vector<RangeExtensionRef> &InputSection<E>::get_range_extn() const {
-  return file.range_extn[section_idx];
+  return file.range_extn[shndx];
 }
 
 template <typename E>
 inline std::vector<i32> &InputSection<E>::get_r_deltas() const {
-  return file.r_deltas[section_idx];
+  return file.r_deltas[shndx];
 }
 
 template <typename E>
-inline std::vector<Symbol<E> *> &InputSection<E>::get_sorted_symbols() const {
-  return file.sorted_symbols[section_idx];
+inline std::span<Symbol<E> *> InputSection<E>::get_sorted_symbols() const {
+  return file.sorted_symbols[shndx];
 }
 
 template <typename E>
@@ -1952,7 +2051,7 @@ InputSection<E>::get_fragment(Context<E> &ctx, const ElfRel<E> &rel) {
 }
 
 template <typename E>
-bool InputSection<E>::is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel) {
+inline bool InputSection<E>::is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel) {
   return ctx.arg.pack_dyn_relocs_relr &&
          !(shdr().sh_flags & SHF_EXECINSTR) &&
          (shdr().sh_addralign % E::word_size) == 0 &&
@@ -2023,9 +2122,9 @@ inline InputSection<E> *ObjectFile<E>::get_section(const ElfSym<E> &esym) {
 // This operator defines a total order over symbols. This is used to
 // make the output deterministic.
 template <typename E>
-inline bool Symbol<E>::operator<(const Symbol &other) const {
-  return std::tuple{file->priority, sym_idx} <
-         std::tuple{other.file->priority, other.sym_idx};
+inline bool operator<(const Symbol<E> &a, const Symbol<E> &b) {
+  return std::tuple{a.file->priority, a.sym_idx} <
+         std::tuple{b.file->priority, b.sym_idx};
 }
 
 template <typename E>
@@ -2037,8 +2136,8 @@ inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
       if (!ref.frag->is_alive) {
         // This condition is met if a non-alloc section refers an
         // alloc section and if the referenced piece of data is
-        // garbage-collected. Typically, this condition is met if a
-        // debug info section referring a string constant in .rodata.
+        // garbage-collected. Typically, this condition occurs if a
+        // debug info section refers a string constant in .rodata.
         return 0;
       }
 
@@ -2056,29 +2155,30 @@ inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
     if (is_imported || esym().st_type == STT_GNU_IFUNC)
       return get_plt_addr(ctx);
 
-  if (input_section) {
-    if (input_section->is_ehframe) {
-      // .eh_frame contents are parsed and reconstructed by the linker,
-      // so pointing to a specific location in a source .eh_frame
-      // section doesn't make much sense. However, CRT files contain
-      // symbols pointing to the very beginning and ending of the section.
-      if (name() == "__EH_FRAME_BEGIN__" || name() == "__EH_FRAME_LIST__" ||
-          esym().st_type == STT_SECTION)
-        return ctx.eh_frame->shdr.sh_addr;
-      if (name() == "__FRAME_END__" || name() == "__EH_FRAME_LIST_END__")
-        return ctx.eh_frame->shdr.sh_addr + ctx.eh_frame->shdr.sh_size;
+  if (InputSection<E> *isec = get_input_section()) {
+    if (!isec->is_alive) {
+      if (isec->name() == ".eh_frame") {
+        // .eh_frame contents are parsed and reconstructed by the linker,
+        // so pointing to a specific location in a source .eh_frame
+        // section doesn't make much sense. However, CRT files contain
+        // symbols pointing to the very beginning and ending of the section.
+        if (name() == "__EH_FRAME_BEGIN__" || name() == "__EH_FRAME_LIST__" ||
+            esym().st_type == STT_SECTION)
+          return ctx.eh_frame->shdr.sh_addr;
 
-      // ARM object files contain "$d" local symbol at the beginning
-      // of data sections. Their values are not significant for .eh_frame,
-      // so we just treat them as offset 0.
-      if (name() == "$d" || name().starts_with("$d."))
-        return ctx.eh_frame->shdr.sh_addr;
+        if (name() == "__FRAME_END__" || name() == "__EH_FRAME_LIST_END__")
+          return ctx.eh_frame->shdr.sh_addr + ctx.eh_frame->shdr.sh_size;
 
-      Fatal(ctx) << "symbol referring .eh_frame is not supported: "
-                 << *this << " " << *file;
-    }
+        // ARM object files contain "$d" local symbol at the beginning
+        // of data sections. Their values are not significant for .eh_frame,
+        // so we just treat them as offset 0.
+        if (name() == "$d" || name().starts_with("$d."))
+          return ctx.eh_frame->shdr.sh_addr;
 
-    if (!input_section->is_alive) {
+        Fatal(ctx) << "symbol referring .eh_frame is not supported: "
+                   << *this << " " << *file;
+      }
+
       // The control can reach here if there's a relocation that refers
       // a local symbol belonging to a comdat group section. This is a
       // violation of the spec, as all relocations should use only global
@@ -2086,7 +2186,8 @@ inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
       // relocations.
       return 0;
     }
-    return input_section->get_addr() + value;
+
+    return isec->get_addr() + value;
   }
 
   return value;
@@ -2238,12 +2339,21 @@ template <typename E>
 inline bool Symbol<E>::is_absolute() const {
   if (file->is_dso)
     return esym().is_abs();
-  return !is_imported && !get_frag() && !shndx && !input_section;
+  return !is_imported && !get_frag() && shndx == 0;
 }
 
 template <typename E>
 inline bool Symbol<E>::is_relative() const {
   return !is_absolute();
+}
+
+template <typename E>
+inline InputSection<E> *Symbol<E>::get_input_section() const {
+  if (shndx > 0) {
+    assert(!file->is_dso);
+    return ((ObjectFile<E> *)file)->sections[shndx].get();
+  }
+  return nullptr;
 }
 
 template <typename E>

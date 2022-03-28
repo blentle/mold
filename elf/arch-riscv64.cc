@@ -203,7 +203,7 @@ template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   ElfRel<E> *dynrel = nullptr;
   std::span<ElfRel<E>> rels = get_rels(ctx);
-  std::span<i32> r_deltas = get_r_deltas();
+  std::vector<i32> &r_deltas = get_r_deltas();
 
   i64 frag_idx = 0;
 
@@ -230,21 +230,21 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 #define G   (sym.get_got_addr(ctx) - ctx.got->shdr.sh_addr)
 #define GOT ctx.got->shdr.sh_addr
 
-    if (needs_dynrel[i]) {
-      *dynrel++ = {P, R_RISCV_64, (u32)sym.get_dynsym_idx(ctx), A};
-      *(u64 *)loc = A;
-      continue;
-    }
-
-    if (needs_baserel[i] && !is_relr_reloc(ctx, rel))
-      *dynrel++ = {P, R_RISCV_RELATIVE, 0, (i64)(S + A)};
-
     switch (rel.r_type) {
     case R_RISCV_32:
       *(u32 *)loc = S + A;
       break;
     case R_RISCV_64:
-      *(u64 *)loc = S + A;
+      if (sym.is_absolute() || !ctx.arg.pic) {
+        *(u64 *)loc = S + A;
+      } else if (sym.is_imported) {
+        *dynrel++ = {P, R_RISCV_64, (u32)sym.get_dynsym_idx(ctx), A};
+        *(u64 *)loc = A;
+      } else {
+        if (!is_relr_reloc(ctx, rel))
+          *dynrel++ = {P, R_RISCV_RELATIVE, 0, (i64)(S + A)};
+        *(u64 *)loc = S + A;
+      }
       break;
     case R_RISCV_TLS_DTPMOD32:
     case R_RISCV_TLS_DTPMOD64:
@@ -295,7 +295,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       }
       break;
     case R_RISCV_PCREL_LO12_I:
-      assert(sym.input_section == this);
+      assert(sym.get_input_section() == this);
       assert(sym.value < r_offset);
       write_itype((u32 *)loc, *(u32 *)(base + sym.value));
       break;
@@ -304,7 +304,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       write_itype((u32 *)loc, S + A);
       break;
     case R_RISCV_PCREL_LO12_S:
-      assert(sym.input_section == this);
+      assert(sym.get_input_section() == this);
       assert(sym.value < r_offset);
       write_stype((u32 *)loc, *(u32 *)(base + sym.value));
       break;
@@ -500,7 +500,7 @@ void InputSection<E>::copy_contents_riscv(Context<E> &ctx, u8 *buf) {
   // Memory-allocated sections may be relaxed, so copy each segment
   // individually.
   std::span<ElfRel<E>> rels = get_rels(ctx);
-  std::span<i32> r_deltas = get_r_deltas();
+  std::vector<i32> &r_deltas = get_r_deltas();
   i64 pos = 0;
 
   for (i64 i = 0; i < rels.size(); i++) {
@@ -554,8 +554,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_RISCV_HI20: {
       Action table[][4] = {
         // Absolute  Local    Imported data  Imported code
-        {  NONE,     NONE,    ERROR,         ERROR },      // DSO
-        {  NONE,     NONE,    COPYREL,       PLT   },      // PIE
+        {  NONE,     ERROR,   ERROR,         ERROR },      // DSO
+        {  NONE,     ERROR,   ERROR,         ERROR },      // PIE
         {  NONE,     NONE,    COPYREL,       PLT   },      // PDE
       };
       dispatch(ctx, table, i, rel, sym);
@@ -661,8 +661,8 @@ static void initialize_storage(Context<E> &ctx) {
 
     for (Symbol<E> *sym : file->symbols)
       if (sym->file == file)
-        if (InputSection<E> *isec = sym->input_section)
-          file->sorted_symbols[isec->section_idx].push_back(sym);
+        if (InputSection<E> *isec = sym->get_input_section())
+          file->sorted_symbols[isec->shndx].push_back(sym);
 
     for (std::vector<Symbol<E> *> &vec : file->sorted_symbols)
       sort(vec, [](Symbol<E> *a, Symbol<E> *b) { return a->value < b->value; });
@@ -672,7 +672,7 @@ static void initialize_storage(Context<E> &ctx) {
 // Interpret R_RISCV_ALIGN relocations and align them if necessary.
 // This function may enlarge input sections but never shrinks.
 static void align_contents(Context<E> &ctx, InputSection<E> &isec) {
-  std::span<i32> r_deltas = isec.get_r_deltas();
+  std::vector<i32> &r_deltas = isec.get_r_deltas();
   std::span<Symbol<E> *> syms = isec.get_sorted_symbols();
   i64 delta = 0;
 
@@ -727,7 +727,7 @@ static i64 compute_distance(Context<E> &ctx, Symbol<E> &sym,
 
 // Relax R_RISCV_CALL and R_RISCV_CALL_PLT relocations.
 static void relax_call(Context<E> &ctx, InputSection<E> &isec) {
-  std::span<i32> r_deltas = isec.get_r_deltas();
+  std::vector<i32> r_deltas = isec.get_r_deltas();
   std::span<Symbol<E> *> syms = isec.get_sorted_symbols();
   i64 delta = 0;
 
