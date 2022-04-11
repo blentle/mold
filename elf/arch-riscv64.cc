@@ -203,7 +203,7 @@ template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   ElfRel<E> *dynrel = nullptr;
   std::span<ElfRel<E>> rels = get_rels(ctx);
-  std::vector<i32> &r_deltas = get_r_deltas();
+  std::span<i32> r_deltas = get_r_deltas();
 
   i64 frag_idx = 0;
 
@@ -434,7 +434,10 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       *(u32 *)loc = S + A;
       break;
     case R_RISCV_64:
-      *(u64 *)loc = S + A;
+      if (std::optional<u64> val = get_tombstone(sym))
+        *(u64 *)loc = *val;
+      else
+        *(u64 *)loc = S + A;
       break;
     case R_RISCV_ADD8:
       *loc += S + A;
@@ -500,7 +503,7 @@ void InputSection<E>::copy_contents_riscv(Context<E> &ctx, u8 *buf) {
   // Memory-allocated sections may be relaxed, so copy each segment
   // individually.
   std::span<ElfRel<E>> rels = get_rels(ctx);
-  std::vector<i32> &r_deltas = get_r_deltas();
+  std::span<i32> r_deltas = get_r_deltas();
   i64 pos = 0;
 
   for (i64 i = 0; i < rels.size(); i++) {
@@ -556,7 +559,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         // Absolute  Local    Imported data  Imported code
         {  NONE,     ERROR,   ERROR,         ERROR },      // DSO
         {  NONE,     ERROR,   ERROR,         ERROR },      // PIE
-        {  NONE,     NONE,    COPYREL,       PLT   },      // PDE
+        {  NONE,     NONE,    COPYREL,       CPLT  },      // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;
@@ -566,7 +569,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
         // Absolute  Local    Imported data  Imported code
         {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
         {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       PLT    },     // PDE
+        {  NONE,     NONE,    COPYREL,       CPLT   },     // PDE
       };
       dispatch(ctx, table, i, rel, sym);
       break;
@@ -672,7 +675,7 @@ static void initialize_storage(Context<E> &ctx) {
 // Interpret R_RISCV_ALIGN relocations and align them if necessary.
 // This function may enlarge input sections but never shrinks.
 static void align_contents(Context<E> &ctx, InputSection<E> &isec) {
-  std::vector<i32> &r_deltas = isec.get_r_deltas();
+  std::span<i32> r_deltas = isec.get_r_deltas();
   std::span<Symbol<E> *> syms = isec.get_sorted_symbols();
   i64 delta = 0;
 
@@ -727,7 +730,7 @@ static i64 compute_distance(Context<E> &ctx, Symbol<E> &sym,
 
 // Relax R_RISCV_CALL and R_RISCV_CALL_PLT relocations.
 static void relax_call(Context<E> &ctx, InputSection<E> &isec) {
-  std::vector<i32> r_deltas = isec.get_r_deltas();
+  std::span<i32> r_deltas = isec.get_r_deltas();
   std::span<Symbol<E> *> syms = isec.get_sorted_symbols();
   i64 delta = 0;
 

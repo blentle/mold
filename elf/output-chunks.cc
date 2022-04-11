@@ -48,27 +48,24 @@ u64 get_entry_addr(Context<E> &ctx) {
 
 template <typename E>
 u64 get_eflags(Context<E> &ctx) {
+  if constexpr (std::is_same_v<E, ARM32>)
+    return EF_ARM_EABI_VER5;
+
+  if constexpr (std::is_same_v<E, RISCV64>) {
+    std::vector<ObjectFile<RISCV64> *> objs = ctx.objs;
+    std::erase(objs, ctx.internal_obj);
+
+    if (objs.empty())
+      return 0;
+
+    u32 ret = objs[0]->get_ehdr().e_flags;
+    for (ObjectFile<RISCV64> *file : std::span(objs).subspan(1))
+      if (file->get_ehdr().e_flags & EF_RISCV_RVC)
+        ret |= EF_RISCV_RVC;
+    return ret;
+  }
+
   return 0;
-}
-
-template <>
-u64 get_eflags<ARM32>(Context<ARM32> &ctx) {
-  return EF_ARM_EABI_VER5;
-}
-
-template <>
-u64 get_eflags<RISCV64>(Context<RISCV64> &ctx) {
-  std::vector<ObjectFile<RISCV64> *> objs = ctx.objs;
-  std::erase(objs, ctx.internal_obj);
-
-  if (objs.empty())
-    return 0;
-
-  u32 ret = objs[0]->get_ehdr().e_flags;
-  for (ObjectFile<RISCV64> *file : std::span(objs).subspan(1))
-    if (file->get_ehdr().e_flags & EF_RISCV_RVC)
-      ret |= EF_RISCV_RVC;
-  return ret;
 }
 
 template <typename E>
@@ -212,7 +209,8 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
   };
 
   // Create a PT_PHDR for the program header itself.
-  define(PT_PHDR, PF_R, E::word_size, ctx.phdr);
+  if (ctx.phdr)
+    define(PT_PHDR, PF_R, E::word_size, ctx.phdr);
 
   // Create a PT_INTERP.
   if (ctx.interp)
@@ -250,7 +248,9 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
 
       if (!is_bss(first))
         while (i < end && !is_bss(chunks[i]) &&
-               to_phdr_flags(ctx, chunks[i]) == flags)
+               to_phdr_flags(ctx, chunks[i]) == flags &&
+               chunks[i]->shdr.sh_addr - first->shdr.sh_addr ==
+               chunks[i]->shdr.sh_offset - first->shdr.sh_offset)
           append(chunks[i++]);
 
       while (i < end && is_bss(chunks[i]) &&
@@ -268,10 +268,16 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
     i++;
     while (i < ctx.chunks.size() && (ctx.chunks[i]->shdr.sh_flags & SHF_TLS))
       append(ctx.chunks[i++]);
+
+    // Some types of TLS relocations are defined relative to the TLS
+    // segment, so save its addresses for easy access.
+    ElfPhdr<E> &phdr = vec.back();
+    ctx.tls_begin = phdr.p_vaddr;
+    ctx.tls_end = align_to(phdr.p_vaddr + phdr.p_memsz, phdr.p_align);
   }
 
   // Add PT_DYNAMIC
-  if (ctx.dynamic->shdr.sh_size)
+  if (ctx.dynamic && ctx.dynamic->shdr.sh_size)
     define(PT_DYNAMIC, PF_R | PF_W, 1, ctx.dynamic);
 
   // Add PT_GNU_EH_FRAME
@@ -301,6 +307,16 @@ std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx) {
       assert(i == ctx.chunks.size() ||
              ctx.chunks[i]->shdr.sh_addr % ctx.page_size == 0);
       vec.back().p_memsz = align_to(vec.back().p_memsz, ctx.page_size);
+    }
+  }
+
+  // Add PT_ARM_EDXIDX
+  if constexpr (std::is_same_v<E, ARM32>) {
+    for (Chunk<E> *chunk : ctx.chunks) {
+      if (chunk->shdr.sh_type == SHT_ARM_EXIDX) {
+        define(PT_ARM_EXIDX, PF_R, 4, chunk);
+        break;
+      }
     }
   }
 
@@ -349,7 +365,7 @@ void RelDynSection<E>::update_shdr(Context<E> &ctx) {
 
 template <typename E>
 static ElfRel<E> reloc(u64 offset, u32 type, u32 sym, i64 addend = 0) {
-  if constexpr (E::e_machine == EM_386 || E::e_machine == EM_ARM)
+  if constexpr (std::is_same_v<E, I386> || std::is_same_v<E, ARM32>)
     return {(u32)offset, type, sym};
   else
     return {offset, type, sym, addend};
@@ -471,6 +487,9 @@ void ShstrtabSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 i64 DynstrSection<E>::add_string(std::string_view str) {
+  if (this->shdr.sh_size == 0)
+    this->shdr.sh_size = 1;
+
   if (str.empty())
     return 0;
 
@@ -581,7 +600,8 @@ static std::vector<typename E::WordTy> create_dynamic_section(Context<E> &ctx) {
     define(DT_NEEDED, ctx.dynstr->find_string(file->soname));
 
   if (!ctx.arg.rpaths.empty())
-    define(DT_RUNPATH, ctx.dynstr->find_string(ctx.arg.rpaths));
+    define(ctx.arg.enable_new_dtags ? DT_RUNPATH : DT_RPATH,
+           ctx.dynstr->find_string(ctx.arg.rpaths));
 
   if (!ctx.arg.soname.empty())
     define(DT_SONAME, ctx.dynstr->find_string(ctx.arg.soname));
@@ -753,9 +773,15 @@ static std::string_view get_output_name(Context<E> &ctx, std::string_view name) 
   if (name.starts_with( ".rodata.str"))
     return ".rodata.str";
 
+  if (name.starts_with(".ARM.exidx"))
+    return ".ARM.exidx";
+  if (name.starts_with(".ARM.extab"))
+    return ".ARM.extab";
+
   static std::string_view prefixes[] = {
     ".text.", ".data.rel.ro.", ".data.", ".rodata.", ".bss.rel.ro.", ".bss.",
     ".init_array.", ".fini_array.", ".tbss.", ".tdata.", ".gcc_except_table.",
+    ".ctors.", ".dtors.",
   };
 
   for (std::string_view prefix : prefixes) {
@@ -791,6 +817,7 @@ static std::string_view get_output_name(Context<E> &ctx, std::string_view name) 
   return name;
 }
 
+template <typename E>
 static u64 canonicalize_type(std::string_view name, u64 type) {
   if (type == SHT_PROGBITS) {
     if (name == ".init_array" || name.starts_with(".init_array."))
@@ -798,8 +825,11 @@ static u64 canonicalize_type(std::string_view name, u64 type) {
     if (name == ".fini_array" || name.starts_with(".fini_array."))
       return SHT_FINI_ARRAY;
   }
-  if (type == SHT_X86_64_UNWIND)
-    return SHT_PROGBITS;
+
+  if constexpr (std::is_same_v<E, X86_64>)
+    if (type == SHT_X86_64_UNWIND)
+      return SHT_PROGBITS;
+
   return type;
 }
 
@@ -808,8 +838,8 @@ OutputSection<E> *
 OutputSection<E>::get_instance(Context<E> &ctx, std::string_view name,
                                u64 type, u64 flags) {
   name = get_output_name(ctx, name);
-  type = canonicalize_type(name, type);
-  flags = flags & ~(u64)SHF_GROUP & ~(u64)SHF_COMPRESSED;
+  type = canonicalize_type<E>(name, type);
+  flags = flags & ~(u64)SHF_GROUP & ~(u64)SHF_COMPRESSED & ~(u64)SHF_LINK_ORDER;
 
   // .init_array is usually writable. We don't want to create multiple
   // .init_array output sections, so make it always writable.
@@ -969,7 +999,7 @@ void GotSection<E>::add_tlsgd_symbol(Context<E> &ctx, Symbol<E> *sym) {
 
 template <typename E>
 void GotSection<E>::add_tlsdesc_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  assert(E::e_machine != EM_RISCV);
+  assert(E::supports_tlsdesc);
   sym->set_tlsdesc_idx(ctx, this->shdr.sh_size / E::word_size);
   this->shdr.sh_size += E::word_size * 2;
   tlsdesc_syms.push_back(sym);
@@ -1033,7 +1063,7 @@ std::vector<GotEntry<E>> GotSection<E>::get_entries(Context<E> &ctx) const {
     i64 idx = sym->get_tlsgd_idx(ctx);
 
     if (ctx.arg.is_static) {
-      entries.push_back({idx, 0});
+      entries.push_back({idx, 1});
       entries.push_back({idx + 1, sym->get_addr(ctx) - ctx.tls_begin});
     } else {
       entries.push_back({idx, 0, E::R_DTPMOD, sym});
@@ -1041,10 +1071,10 @@ std::vector<GotEntry<E>> GotSection<E>::get_entries(Context<E> &ctx) const {
     }
   }
 
-  // NB: TLSDESC is not defined for the RISC-V psABI.
-  if constexpr (E::e_machine != EM_RISCV)
+  if constexpr (E::supports_tlsdesc)
     for (Symbol<E> *sym : tlsdesc_syms)
-      entries.push_back({sym->get_tlsdesc_idx(ctx), 0, E::R_TLSDESC, sym});
+      entries.push_back({sym->get_tlsdesc_idx(ctx), 0, E::R_TLSDESC,
+                         sym == ctx._TLS_MODULE_BASE_ ? nullptr : sym});
 
   for (Symbol<E> *sym : gottp_syms) {
     i64 idx = sym->get_gottp_idx(ctx);
@@ -1064,15 +1094,16 @@ std::vector<GotEntry<E>> GotSection<E>::get_entries(Context<E> &ctx) const {
     }
 
     // Otherwise, we know the offset at link-time, so fill the GOT entry.
-    if constexpr (E::e_machine == EM_X86_64 || E::e_machine == EM_386) {
+    if constexpr (std::is_same_v<E, X86_64> || std::is_same_v<E, I386>)
       entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_end});
-    } else if constexpr (E::e_machine == EM_AARCH64) {
+    else if constexpr (std::is_same_v<E, ARM32>)
+      entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin + 8});
+    else if constexpr (std::is_same_v<E, ARM64>)
       entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin + 16});
-    } else if constexpr (E::e_machine == EM_RISCV || E::e_machine == EM_ARM) {
+    else if constexpr (std::is_same_v<E, RISCV64>)
       entries.push_back({idx, sym->get_addr(ctx) - ctx.tls_begin});
-    } else {
+    else
       unreachable();
-    }
   }
 
   if (tlsld_idx != -1)
@@ -1123,17 +1154,17 @@ void GotPltSection<E>::copy_buf(Context<E> &ctx) {
   buf[2] = 0;
 
   auto get_plt_resolver_addr = [&](Symbol<E> &sym) -> u64 {
-    if constexpr (E::e_machine == EM_AARCH64 || E::e_machine == EM_ARM ||
-                  E::e_machine == EM_RISCV)
+    if constexpr (std::is_same_v<E, ARM64> || std::is_same_v<E, ARM32> ||
+                  std::is_same_v<E, RISCV64>)
       return ctx.plt->shdr.sh_addr;
 
-    if constexpr (E::e_machine == EM_X86_64) {
+    if constexpr (std::is_same_v<E, X86_64>) {
       if (ctx.arg.z_ibtplt)
         return ctx.plt->shdr.sh_addr;
       return sym.get_plt_addr(ctx) + 6;
     }
 
-    if constexpr (E::e_machine == EM_386)
+    if constexpr (std::is_same_v<E, I386>)
       return sym.get_plt_addr(ctx) + 6;
     unreachable();
   };
@@ -1146,10 +1177,8 @@ template <typename E>
 void PltSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
   assert(!sym->has_plt(ctx));
 
-  if (this->shdr.sh_size == 0) {
+  if (this->shdr.sh_size == 0)
     this->shdr.sh_size = ctx.plt_hdr_size;
-    ctx.gotplt->shdr.sh_size = E::word_size * 3;
-  }
 
   sym->set_plt_idx(ctx, symbols.size());
   this->shdr.sh_size += ctx.plt_size;
@@ -1189,6 +1218,9 @@ void RelPltSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void DynsymSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
+  if (symbols.empty())
+    symbols.resize(1);
+
   if (sym->get_dynsym_idx(ctx) != -1)
     return;
   sym->set_dynsym_idx(ctx, -2);
@@ -1295,10 +1327,7 @@ void DynsymSection<E>::copy_buf(Context<E> &ctx) {
     } else if (sym.file->is_dso || sym.esym().is_undef()) {
       esym.st_shndx = SHN_UNDEF;
       esym.st_size = 0;
-      if (sym.has_plt(ctx) && !ctx.arg.pic && sym.is_imported) {
-        // Emit an address for a canonical PLT
-        esym.st_value = sym.get_plt_addr(ctx);
-      }
+      esym.st_value = sym.is_canonical ? sym.get_plt_addr(ctx) : 0;
     } else {
       InputSection<E> *isec = sym.get_input_section();
       if (!isec) {
