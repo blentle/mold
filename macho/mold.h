@@ -11,6 +11,19 @@
 #include <unordered_map>
 #include <variant>
 
+#define XXH_INLINE_ALL 1
+#include <xxhash.h>
+
+#if MOLD_DEBUG_X86_64_ONLY
+# define INSTANTIATE_ALL INSTANTIATE(X86_64)
+#elif MOLD_DEBUG_ARM64_ONLY
+# define INSTANTIATE_ALL INSTANTIATE(ARM64)
+#else
+# define INSTANTIATE_ALL                        \
+  INSTANTIATE(X86_64);                          \
+  INSTANTIATE(ARM64);
+#endif
+
 namespace mold::macho {
 
 static constexpr i64 COMMON_PAGE_SIZE = 0x4000;
@@ -23,8 +36,19 @@ template <typename E> class Subsection;
 template <typename E> struct Context;
 template <typename E> struct Symbol;
 
+class HashCmp {
+public:
+  static size_t hash(const std::string_view &k) {
+    return XXH3_64bits(k.data(), k.size());
+  }
+
+  static bool equal(const std::string_view &k1, const std::string_view &k2) {
+    return k1 == k2;
+  }
+};
+
 //
-// object-file.cc
+// input-files.cc
 //
 
 template <typename E>
@@ -42,7 +66,7 @@ template <typename E>
 struct UnwindRecord {
   UnwindRecord(u32 len, u32 enc) : code_len(len), encoding(enc) {}
 
-  inline u64 get_func_raddr(Context<E> &ctx) const;
+  u64 get_func_raddr() const { return subsec->raddr + offset; }
 
   Subsection<E> *subsec = nullptr;
   u32 offset = 0;
@@ -63,9 +87,9 @@ public:
   std::vector<Symbol<E> *> syms;
   i64 priority = 0;
   std::atomic_bool is_alive = false;
+  bool is_dylib = false;
+  bool is_hidden = false;
   std::string archive_name;
-
-  virtual bool is_dylib() const = 0;
 
 protected:
   InputFile() = default;
@@ -78,14 +102,13 @@ public:
 
   static ObjectFile *create(Context<E> &ctx, MappedFile<Context<E>> *mf,
                             std::string archive_name);
-  bool is_dylib() const override { return false; }
   void parse(Context<E> &ctx);
   Subsection<E> *find_subsection(Context<E> &ctx, u32 addr);
   void parse_compact_unwind(Context<E> &ctx, MachSection &hdr);
-  void resolve_regular_symbols(Context<E> &ctx);
-  void resolve_lazy_symbols(Context<E> &ctx);
+  void resolve_symbols(Context<E> &ctx);
   bool is_objc_object(Context<E> &ctx);
-  std::vector<ObjectFile *> mark_live_objects(Context<E> &ctx);
+  void mark_live_objects(Context<E> &ctx,
+                         std::function<void(ObjectFile<E> *)> feeder);
   void convert_common_symbols(Context<E> &ctx);
   void check_duplicate_symbols(Context<E> &ctx);
 
@@ -101,12 +124,11 @@ public:
 
 private:
   void parse_sections(Context<E> &ctx);
-  void parse_symtab(Context<E> &ctx);
+  void parse_symbols(Context<E> &ctx);
   void split_subsections(Context<E> &ctx);
   void parse_data_in_code(Context<E> &ctx);
   LoadCommand *find_load_command(Context<E> &ctx, u32 type);
   i64 find_subsection_idx(Context<E> &ctx, u32 addr);
-  void override_symbol(Context<E> &ctx, i64 symidx);
   InputSection<E> *get_common_sec(Context<E> &ctx);
 
   MachSection *unwind_sec = nullptr;
@@ -118,6 +140,7 @@ template <typename E>
 class DylibFile : public InputFile<E> {
 public:
   static DylibFile *create(Context<E> &ctx, MappedFile<Context<E>> *mf);
+
   void parse(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx);
 
@@ -125,14 +148,13 @@ public:
   i64 dylib_idx = 0;
   std::atomic_bool is_needed = false;
 
-  bool is_dylib() const override { return true; }
-
 private:
   void parse_dylib(Context<E> &ctx);
   void read_trie(Context<E> &ctx, u8 *start, i64 offset = 0,
                  const std::string &prefix = "");
 
   DylibFile() {
+    this->is_dylib = true;
     this->is_alive = true;
   }
 };
@@ -230,8 +252,8 @@ struct Symbol {
   std::atomic_uint8_t flags = 0;
 
   u8 is_extern : 1 = false;
-  u8 is_lazy : 1 = false;
   u8 is_common : 1 = false;
+  u8 is_imported : 1 = false;
   u8 referenced_dynamically : 1 = false;
 
   inline u64 get_addr(Context<E> &ctx) const;
@@ -277,7 +299,7 @@ public:
   MachSection hdr = {};
   u32 sect_idx = 0;
   bool is_hidden = false;
-  bool is_regular = false;
+  bool is_output_section = false;
 };
 
 template <typename E>
@@ -305,7 +327,7 @@ public:
   OutputSection(Context<E> &ctx, std::string_view segname,
                 std::string_view sectname)
     : Chunk<E>(ctx, segname, sectname) {
-    this->is_regular = true;
+    this->is_output_section = true;
   }
 
   void compute_size(Context<E> &ctx) override;
@@ -337,9 +359,9 @@ private:
 };
 
 template <typename E>
-class OutputRebaseSection : public Chunk<E> {
+class RebaseSection : public Chunk<E> {
 public:
-  OutputRebaseSection(Context<E> &ctx)
+  RebaseSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__rebase") {
     this->is_hidden = true;
   }
@@ -368,9 +390,9 @@ private:
 };
 
 template <typename E>
-class OutputBindSection : public Chunk<E> {
+class BindSection : public Chunk<E> {
 public:
-  OutputBindSection(Context<E> &ctx)
+  BindSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__binding") {
     this->is_hidden = true;
   }
@@ -382,9 +404,9 @@ public:
 };
 
 template <typename E>
-class OutputLazyBindSection : public Chunk<E> {
+class LazyBindSection : public Chunk<E> {
 public:
-  OutputLazyBindSection(Context<E> &ctx)
+  LazyBindSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__lazy_binding") {
     this->is_hidden = true;
     this->hdr.p2align = std::countr_zero(8U);
@@ -433,9 +455,9 @@ private:
 };
 
 template <typename E>
-class OutputExportSection : public Chunk<E> {
+class ExportSection : public Chunk<E> {
 public:
-  OutputExportSection(Context<E> &ctx)
+  ExportSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__export") {
     this->is_hidden = true;
   }
@@ -448,9 +470,9 @@ private:
 };
 
 template <typename E>
-class OutputFunctionStartsSection : public Chunk<E> {
+class FunctionStartsSection : public Chunk<E> {
 public:
-  OutputFunctionStartsSection(Context<E> &ctx)
+  FunctionStartsSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__func_starts") {
     this->is_hidden = true;
   }
@@ -462,9 +484,9 @@ public:
 };
 
 template <typename E>
-class OutputSymtabSection : public Chunk<E> {
+class SymtabSection : public Chunk<E> {
 public:
-  OutputSymtabSection(Context<E> &ctx)
+  SymtabSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__symbol_table") {
     this->is_hidden = true;
     this->hdr.p2align = std::countr_zero(8U);
@@ -484,9 +506,9 @@ public:
 };
 
 template <typename E>
-class OutputStrtabSection : public Chunk<E> {
+class StrtabSection : public Chunk<E> {
 public:
-  OutputStrtabSection(Context<E> &ctx)
+  StrtabSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__string_table") {
     this->is_hidden = true;
     this->hdr.p2align = std::countr_zero(8U);
@@ -500,9 +522,9 @@ public:
 };
 
 template <typename E>
-class OutputIndirectSymtabSection : public Chunk<E> {
+class IndirectSymtabSection : public Chunk<E> {
 public:
-  OutputIndirectSymtabSection(Context<E> &ctx)
+  IndirectSymtabSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__ind_sym_tab") {
     this->is_hidden = true;
   }
@@ -589,7 +611,7 @@ private:
   u32 encode_personality(Context<E> &ctx, Symbol<E> *sym);
 
   std::vector<std::span<UnwindRecord<E>>>
-  split_records(Context<E> &ctx, std::span<UnwindRecord<E>>);
+  split_records(std::span<UnwindRecord<E>> records);
 
   std::vector<Symbol<E> *> personalities;
 };
@@ -725,8 +747,7 @@ TextDylib parse_tbd(Context<E> &ctx, MappedFile<Context<E>> *mf);
 //
 
 template <typename E>
-void parse_nonpositional_args(Context<E> &ctx,
-                              std::vector<std::string> &remaining);
+std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
 
 //
 // dead-strip.cc
@@ -772,7 +793,7 @@ struct Context {
     bool ObjC = false;
     bool adhoc_codesign = true;
     bool color_diagnostics = false;
-    bool dead_strip = true;
+    bool dead_strip = false;
     bool dead_strip_dylibs = false;
     bool deduplicate = true;
     bool demangle = false;
@@ -780,6 +801,7 @@ struct Context {
     bool dynamic = true;
     bool fatal_warnings = false;
     bool noinhibit_exec = false;
+    bool search_paths_first = true;
     bool trace = false;
     i64 arch = CPU_TYPE_ARM64;
     i64 headerpad = 256;
@@ -787,10 +809,13 @@ struct Context {
     i64 platform = PLATFORM_MACOS;
     i64 platform_min_version = 0;
     i64 platform_sdk_version = 0;
+    i64 stack_size = 0;
     std::string chroot;
     std::string entry = "_main";
+    std::string install_name;
     std::string map;
     std::string output = "a.out";
+    std::vector<std::string> U;
     std::vector<std::string> framework_paths;
     std::vector<std::string> library_paths;
     std::vector<std::string> rpath;
@@ -799,10 +824,13 @@ struct Context {
 
   std::vector<std::string_view> cmdline_args;
   u32 output_type = MH_EXECUTE;
+  bool all_load = false;
+  bool needed_l = false;
+  bool hidden_l = false;
 
   bool has_error = false;
 
-  tbb::concurrent_hash_map<std::string_view, Symbol<E>> symbol_map;
+  tbb::concurrent_hash_map<std::string_view, Symbol<E>, HashCmp> symbol_map;
 
   std::unique_ptr<OutputFile<E>> output_file;
   u8 *buf;
@@ -836,14 +864,14 @@ struct Context {
   DataInCodeSection<E> data_in_code{*this};
   ThreadPtrsSection<E> thread_ptrs{*this};
 
-  OutputRebaseSection<E> rebase{*this};
-  OutputBindSection<E> bind{*this};
-  OutputLazyBindSection<E> lazy_bind{*this};
-  OutputExportSection<E> export_{*this};
-  OutputFunctionStartsSection<E> function_starts{*this};
-  OutputSymtabSection<E> symtab{*this};
-  OutputIndirectSymtabSection<E> indir_symtab{*this};
-  OutputStrtabSection<E> strtab{*this};
+  RebaseSection<E> rebase{*this};
+  BindSection<E> bind{*this};
+  LazyBindSection<E> lazy_bind{*this};
+  ExportSection<E> export_{*this};
+  FunctionStartsSection<E> function_starts{*this};
+  SymtabSection<E> symtab{*this};
+  IndirectSymtabSection<E> indir_symtab{*this};
+  StrtabSection<E> strtab{*this};
 
   OutputSection<E> *text = nullptr;
   OutputSection<E> *data = nullptr;
@@ -910,11 +938,6 @@ Chunk<E>::Chunk(Context<E> &ctx, std::string_view segname,
   ctx.chunks.push_back(this);
   hdr.set_segname(segname);
   hdr.set_sectname(sectname);
-}
-
-template <typename E>
-u64 UnwindRecord<E>::get_func_raddr(Context<E> &ctx) const {
-  return subsec->raddr + offset;
 }
 
 } // namespace mold::macho

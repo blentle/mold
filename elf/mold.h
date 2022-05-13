@@ -4,6 +4,7 @@
 #include "../mold.h"
 
 #include <atomic>
+#include <bitset>
 #include <cassert>
 #include <cstdint>
 #include <fstream>
@@ -32,6 +33,23 @@
 
 #define XXH_INLINE_ALL 1
 #include <xxhash.h>
+
+// MOLD_DEBUG_{X86_64,ARM64}_ONLY are macros to speed up builds.
+// This should be used only for debugging. When you use this flag,
+// you need to compile mold C++ files with `-ffunction-sections
+// -fdata-sections` and link them with -Wl,-gc-sections.
+#if MOLD_DEBUG_X86_64_ONLY
+# define INSTANTIATE_ALL INSTANTIATE(X86_64)
+#elif MOLD_DEBUG_ARM64_ONLY
+# define INSTANTIATE_ALL INSTANTIATE(ARM64)
+#else
+# define INSTANTIATE_ALL                        \
+  INSTANTIATE(X86_64);                          \
+  INSTANTIATE(I386);                            \
+  INSTANTIATE(ARM64);                           \
+  INSTANTIATE(ARM32);                           \
+  INSTANTIATE(RISCV64)
+#endif
 
 namespace mold::elf {
 
@@ -154,7 +172,7 @@ struct CieRecord {
       rel_idx(rel_idx), rels(rels), contents(file.get_string(ctx, isec.shdr())) {}
 
   i64 size() const {
-    return *(u32 *)(contents.data() + input_offset) + 4;
+    return *(ul32 *)(contents.data() + input_offset) + 4;
   }
 
   std::string_view get_contents() const {
@@ -266,8 +284,8 @@ public:
   InputSection(Context<E> &ctx, ObjectFile<E> &file, std::string_view name,
                i64 shndx);
 
-  bool is_compressed();
-  void uncompress(Context<E> &ctx, u8 *buf);
+  void uncompress(Context<E> &ctx);
+  void uncompress_to(Context<E> &ctx, u8 *buf);
   void scan_relocations(Context<E> &ctx);
   void write_to(Context<E> &ctx, u8 *buf);
   void apply_reloc_alloc(Context<E> &ctx, u8 *base);
@@ -307,9 +325,11 @@ public:
 
   // For COMDAT de-duplication and garbage collection
   std::atomic_bool is_alive = true;
-  bool killed_by_icf = false;
-
   u8 p2align = 0;
+
+  u8 compressed : 1 = false;
+  u8 uncompressed : 1 = false;
+  u8 killed_by_icf : 1 = false;
 
 private:
   typedef enum : u8 { NONE, ERROR, COPYREL, PLT, CPLT, DYNREL, BASEREL } Action;
@@ -336,25 +356,25 @@ void report_undef(Context<E> &ctx, InputFile<E> &file, Symbol<E> &sym);
 template <typename E>
 bool is_relro(Context<E> &ctx, Chunk<E> *chunk);
 
-template <typename E>
-bool separate_page(Context<E> &ctx, Chunk<E> *a, Chunk<E> *b);
+typedef enum { HEADER, OUTPUT_SECTION, SYNTHETIC } ChunkKind;
 
 // Chunk represents a contiguous region in an output file.
 template <typename E>
 class Chunk {
 public:
   virtual ~Chunk() = default;
-
-  virtual bool is_header() const { return false; }
-  virtual bool is_output_section() const { return false; }
-
+  virtual ChunkKind kind() { return SYNTHETIC; }
   virtual void copy_buf(Context<E> &ctx) {}
   virtual void write_to(Context<E> &ctx, u8 *buf);
   virtual void update_shdr(Context<E> &ctx) {}
 
+  // For --gdb-index
+  virtual u8 *get_uncompressed_data() { return nullptr; }
+
   std::string_view name;
-  i64 shndx = 0;
   ElfShdr<E> shdr = {};
+  i64 shndx = 0;
+  i64 extra_addralign = 1;
 
 protected:
   Chunk() { shdr.sh_addralign = 1; }
@@ -370,7 +390,7 @@ public:
     this->shdr.sh_addralign = E::word_size;
   }
 
-  bool is_header() const override { return true; }
+  ChunkKind kind() override { return HEADER; }
   void copy_buf(Context<E> &ctx) override;
 };
 
@@ -382,7 +402,7 @@ public:
     this->shdr.sh_addralign = E::word_size;
   }
 
-  bool is_header() const override { return true; }
+  ChunkKind kind() override { return HEADER; }
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
 };
@@ -396,9 +416,12 @@ public:
     this->shdr.sh_addralign = E::word_size;
   }
 
-  bool is_header() const override { return true; }
+  ChunkKind kind() override { return HEADER; }
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
+
+private:
+  std::vector<ElfPhdr<E>> phdrs;
 };
 
 template <typename E>
@@ -421,7 +444,7 @@ public:
   static OutputSection *
   get_instance(Context<E> &ctx, std::string_view name, u64 type, u64 flags);
 
-  bool is_output_section() const override { return true; }
+  ChunkKind kind() override { return OUTPUT_SECTION; }
   void copy_buf(Context<E> &ctx) override;
   void write_to(Context<E> &ctx, u8 *buf) override;
 
@@ -867,15 +890,66 @@ public:
   u32 features = 0;
 };
 
+struct GdbIndexName {
+  std::string_view name;
+  u32 hash = 0;
+  u32 attr = 0;
+  u32 entry_idx = 0;
+};
+
+template <typename E>
+class GdbIndexSection : public Chunk<E> {
+public:
+  GdbIndexSection() {
+    this->name = ".gdb_index";
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_addralign = 4;
+  }
+
+  void construct(Context<E> &ctx);
+  void copy_buf(Context<E> &ctx) override;
+  void write_address_areas(Context<E> &ctx);
+
+private:
+  struct SectionHeader {
+    u32 version = 7;
+    u32 cu_list_offset = 0;
+    u32 cu_types_offset = 0;
+    u32 areas_offset = 0;
+    u32 symtab_offset = 0;
+    u32 const_pool_offset = 0;
+  };
+
+  struct MapEntry {
+    MapEntry(ObjectFile<E> *owner, u32 hash) : owner(owner), hash(hash) {}
+
+    MapEntry(const MapEntry &other)
+      : owner(other.owner.load()), num_attrs(other.num_attrs.load()),
+        hash(other.hash), name_offset(other.name_offset),
+        attr_offset(other.attr_offset) {}
+
+    std::atomic<ObjectFile<E> *> owner;
+    std::atomic_uint32_t num_attrs = 0;
+    u32 hash = 0;
+    u32 name_offset = -1;
+    u32 attr_offset = -1;
+  };
+
+  SectionHeader header;
+  ConcurrentMap<MapEntry> map;
+};
+
 template <typename E>
 class GabiCompressedSection : public Chunk<E> {
 public:
   GabiCompressedSection(Context<E> &ctx, Chunk<E> &chunk);
   void copy_buf(Context<E> &ctx) override;
+  u8 *get_uncompressed_data() override { return uncompressed.get(); }
 
 private:
   ElfChdr<E> chdr = {};
-  std::unique_ptr<ZlibCompressor> contents;
+  std::unique_ptr<ZlibCompressor> compressed;
+  std::unique_ptr<u8[]> uncompressed;
 };
 
 template <typename E>
@@ -883,11 +957,13 @@ class GnuCompressedSection : public Chunk<E> {
 public:
   GnuCompressedSection(Context<E> &ctx, Chunk<E> &chunk);
   void copy_buf(Context<E> &ctx) override;
+  u8 *get_uncompressed_data() override { return uncompressed.get(); }
 
 private:
   static constexpr i64 HEADER_SIZE = 12;
   i64 original_size = 0;
-  std::unique_ptr<ZlibCompressor> contents;
+  std::unique_ptr<ZlibCompressor> compressed;
+  std::unique_ptr<u8[]> uncompressed;
 };
 
 template <typename E>
@@ -907,8 +983,23 @@ private:
 
 bool is_c_identifier(std::string_view name);
 
+//
+// dwarf.cc
+//
+
 template <typename E>
-std::vector<ElfPhdr<E>> create_phdr(Context<E> &ctx);
+std::vector<std::string_view>
+read_compunits(Context<E> &ctx, ObjectFile<E> &file);
+
+template <typename E>
+std::vector<GdbIndexName> read_pubnames(Context<E> &ctx, ObjectFile<E> &file);
+
+template <typename E>
+i64 estimate_address_areas(Context<E> &ctx, ObjectFile<E> &file);
+
+template <typename E>
+std::vector<u64>
+read_address_areas(Context<E> &ctx, ObjectFile<E> &file, i64 offset);
 
 //
 // input-files.cc
@@ -1039,10 +1130,11 @@ public:
   std::vector<FdeRecord<E>> fdes;
   std::vector<const char *> symvers;
   std::vector<SectionFragmentRef<E>> sym_fragments;
-  std::vector<std::pair<ComdatGroup *, std::span<u32>>> comdat_groups;
+  std::vector<std::pair<ComdatGroup *, std::span<ul32>>> comdat_groups;
   bool exclude_libs = false;
   u32 features = 0;
   bool is_lto_obj = false;
+  bool needs_executable_stack = false;
 
   u64 num_dynrel = 0;
   u64 reldyn_offset = 0;
@@ -1059,6 +1151,22 @@ public:
   std::vector<std::vector<ElfRel<E>>> sorted_rels;
   std::vector<std::vector<Symbol<E> *>> sorted_symbols;
 
+  // For .gdb_index
+  InputSection<E> *debug_info = nullptr;
+  InputSection<E> *debug_ranges = nullptr;
+  InputSection<E> *debug_rnglists = nullptr;
+  InputSection<E> *debug_pubnames = nullptr;
+  InputSection<E> *debug_pubtypes = nullptr;
+  std::vector<std::string_view> compunits;
+  std::vector<GdbIndexName> gdb_names;
+  i64 compunits_idx = 0;
+  i64 attrs_size = 0;
+  i64 attrs_offset = 0;
+  i64 names_size = 0;
+  i64 names_offset = 0;
+  i64 num_areas = 0;
+  i64 area_offset = 0;
+
 private:
   ObjectFile(Context<E> &ctx, MappedFile<Context<E>> *mf,
              std::string archive_name, bool is_in_lib);
@@ -1073,10 +1181,6 @@ private:
   void override_symbol(Context<E> &ctx, Symbol<E> &sym,
                        const ElfSym<E> &esym, i64 symidx);
   void merge_visibility(Context<E> &ctx, Symbol<E> &sym, u8 visibility);
-
-  std::pair<std::string_view, const ElfShdr<E> *>
-  uncompress_contents(Context<E> &ctx, const ElfShdr<E> &shdr,
-                      std::string_view name);
 
   bool has_common_symbol = false;
 
@@ -1102,6 +1206,7 @@ public:
   void compute_symtab(Context<E> &ctx);
   void write_symtab(Context<E> &ctx);
 
+  bool is_needed = false;
   std::string soname;
   std::vector<std::string_view> version_strings;
   std::vector<ElfSym<E>> elf_syms2;
@@ -1145,7 +1250,7 @@ class GlobPattern {
     Element(Kind k) : kind(k) {}
     Kind kind;
     std::string str;
-    std::vector<bool> bitmap;
+    std::bitset<256> bitset;
   };
 
 public:
@@ -1220,7 +1325,7 @@ void icf_sections(Context<E> &ctx);
 //
 
 template <typename E>
-void combine_objects(Context<E> &ctx, std::span<std::string_view> file_args);
+void combine_objects(Context<E> &ctx, std::span<std::string> file_args);
 
 //
 // mapfile.cc
@@ -1236,13 +1341,6 @@ void print_map(Context<E> &ctx);
 std::function<void()> fork_child();
 
 template <typename E>
-void try_resume_daemon(Context<E> &ctx);
-
-template <typename E>
-void daemonize(Context<E> &ctx, std::function<void()> *wait_for_client,
-               std::function<void()> *on_complete);
-
-template <typename E>
 [[noreturn]]
 void process_run_subcommand(Context<E> &ctx, int argc, char **argv);
 
@@ -1250,16 +1348,8 @@ void process_run_subcommand(Context<E> &ctx, int argc, char **argv);
 // commandline.cc
 //
 
-bool read_flag(std::span<std::string_view> &args, std::string name);
-
 template <typename E>
-bool read_arg(Context<E> &ctx, std::span<std::string_view> &args,
-              std::string_view &arg,
-              std::string name);
-
-template <typename E>
-void parse_nonpositional_args(Context<E> &ctx,
-                              std::vector<std::string_view> &remaining);
+std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
 
 //
 // passes.cc
@@ -1344,7 +1434,6 @@ void sort_arm_exidx(Context<ARM32> &ctx);
 //
 
 i64 create_range_extension_thunks(Context<ARM64> &ctx);
-void write_thunks(Context<ARM64> &ctx);
 
 //
 // arch-riscv64.cc
@@ -1381,8 +1470,7 @@ protected:
 //
 
 struct BuildId {
-  template <typename E>
-  i64 size(Context<E> &ctx) const;
+  i64 size() const;
 
   enum { NONE, HEX, HASH, UUID } kind = NONE;
   std::vector<u8> value;
@@ -1485,6 +1573,7 @@ struct Context {
     bool fatal_warnings = false;
     bool fork = true;
     bool gc_sections = false;
+    bool gdb_index = false;
     bool hash_style_gnu = false;
     bool hash_style_sysv = true;
     bool icf = false;
@@ -1497,7 +1586,6 @@ struct Context {
     bool perf = false;
     bool pic = false;
     bool pie = false;
-    bool preload = false;
     bool print_gc_sections = false;
     bool print_icf_sections = false;
     bool print_map = false;
@@ -1519,6 +1607,7 @@ struct Context {
     bool z_dlopen = true;
     bool z_dump = true;
     bool z_execstack = false;
+    bool z_execstack_if_needed = false;
     bool z_ibt = false;
     bool z_ibtplt = false;
     bool z_initfirst = false;
@@ -1545,7 +1634,7 @@ struct Context {
     std::string entry = "_start";
     std::string fini = "_fini";
     std::string init = "_init";
-    std::string output;
+    std::string output = "a.out";
     std::string plugin;
     std::string rpaths;
     std::string soname;
@@ -1655,8 +1744,16 @@ struct Context {
   std::unique_ptr<VerdefSection<E>> verdef;
   std::unique_ptr<BuildIdSection<E>> buildid;
   std::unique_ptr<NotePropertySection<E>> note_property;
+  std::unique_ptr<GdbIndexSection<E>> gdb_index;
   std::unique_ptr<ThumbToArmSection> thumb_to_arm;
   std::unique_ptr<TlsTrampolineSection> tls_trampoline;
+
+  // For --gdb-index
+  Chunk<E> *debug_info = nullptr;
+  Chunk<E> *debug_abbrev = nullptr;
+  Chunk<E> *debug_ranges = nullptr;
+  Chunk<E> *debug_addr = nullptr;
+  Chunk<E> *debug_rnglists = nullptr;
 
   // For --relocatable
   std::vector<RChunk<E> *> r_chunks;
@@ -1666,8 +1763,8 @@ struct Context {
   RStrtabSection<E> *r_strtab = nullptr;
   RSymtabSection<E> *r_symtab = nullptr;
 
-  u64 tls_begin = -1;
-  u64 tls_end = -1;
+  u64 tls_begin = 0;
+  u64 tls_end = 0;
   bool relax_tlsdesc = false;
 
   // Linker-synthesized symbols
@@ -1801,15 +1898,15 @@ public:
   u64 value = 0;
 
   const char *nameptr = nullptr;
-  u64 namelen : 20 = 0;
+  i32 namelen = 0;
 
   // Index into the symbol table of the owner file.
-  i64 sym_idx : 20 = -1;
+  i32 sym_idx = -1;
 
   // shndx > 0  : symbol is in file's shndx'th section
   // shndx == 0 : absolute symbol
   // shndx < 0  : symbol is in the -shndx'th output section
-  i64 shndx : 20 = 0;
+  i32 shndx = 0;
 
   i32 aux_idx = -1;
   u16 ver_idx = 0;
@@ -1968,7 +2065,7 @@ std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym) {
 
 template <typename E>
 inline i64 FdeRecord<E>::size(ObjectFile<E> &file) const {
-  return *(u32 *)(file.cies[cie_idx].contents.data() + input_offset) + 4;
+  return *(ul32 *)(file.cies[cie_idx].contents.data() + input_offset) + 4;
 }
 
 template <typename E>
@@ -2043,7 +2140,7 @@ inline i64 InputSection<I386>::get_addend(const ElfRel<I386> &rel) const {
     return *loc;
   case R_386_16:
   case R_386_PC16:
-    return *(u16 *)loc;
+    return *(ul16 *)loc;
   case R_386_32:
   case R_386_PC32:
   case R_386_GOT32:
@@ -2059,7 +2156,7 @@ inline i64 InputSection<I386>::get_addend(const ElfRel<I386> &rel) const {
   case R_386_TLS_LDO_32:
   case R_386_SIZE32:
   case R_386_TLS_GOTDESC:
-    return *(u32 *)loc;
+    return *(ul32 *)loc;
   }
   unreachable();
 }
@@ -2067,19 +2164,6 @@ inline i64 InputSection<I386>::get_addend(const ElfRel<I386> &rel) const {
 template <>
 inline i64 InputSection<ARM32>::get_addend(const ElfRel<ARM32> &rel) const {
   u8 *loc = (u8 *)contents.data() + rel.r_offset;
-
-  auto bit = [](u32 val, i64 pos) -> i32 {
-    return (val >> pos) & 1;
-  };
-
-  // Returns [hi:lo] bits of val.
-  auto bits = [](u64 val, i64 hi, i64 lo) -> i32 {
-    return (val >> lo) & (((u64)1 << (hi - lo + 1)) - 1);
-  };
-
-  auto sign_extend = [](u64 val, i64 size) -> i32 {
-    return (i64)(val << (63 - size)) >> (63 - size);
-  };
 
   switch (rel.r_type) {
   case R_ARM_NONE:
@@ -2097,43 +2181,43 @@ inline i64 InputSection<ARM32>::get_addend(const ElfRel<ARM32> &rel) const {
   case R_ARM_TLS_LE32:
   case R_ARM_TLS_GOTDESC:
   case R_ARM_TARGET2:
-    return *(i32 *)loc;
+    return *(il32 *)loc;
   case R_ARM_THM_JUMP11:
-    return sign_extend(*(u16 *)loc, 10) << 1;
+    return sign_extend(*(ul16 *)loc, 10) << 1;
   case R_ARM_THM_CALL:
   case R_ARM_THM_JUMP24:
   case R_ARM_THM_TLS_CALL: {
-    u32 S = bit(*(u16 *)loc, 10);
-    u32 J1 = bit(*(u16 *)(loc + 2), 13);
-    u32 J2 = bit(*(u16 *)(loc + 2), 11);
+    u32 S = bit(*(ul16 *)loc, 10);
+    u32 J1 = bit(*(ul16 *)(loc + 2), 13);
+    u32 J2 = bit(*(ul16 *)(loc + 2), 11);
     u32 I1 = !(J1 ^ S);
     u32 I2 = !(J2 ^ S);
-    u32 imm10 = bits(*(u16 *)loc, 9, 0);
-    u32 imm11 = bits(*(u16 *)(loc + 2), 10, 0);
+    u32 imm10 = bits(*(ul16 *)loc, 9, 0);
+    u32 imm11 = bits(*(ul16 *)(loc + 2), 10, 0);
     u32 val = (S << 24) | (I1 << 23) | (I2 << 22) | (imm10 << 12) | (imm11 << 1);
     return sign_extend(val, 24);
   }
   case R_ARM_CALL:
   case R_ARM_JUMP24:
-    return sign_extend(*(u32 *)loc & 0x00ff'ffff, 23) << 2;
+    return sign_extend(*(ul32 *)loc & 0x00ff'ffff, 23) << 2;
   case R_ARM_MOVW_PREL_NC:
   case R_ARM_MOVW_ABS_NC:
   case R_ARM_MOVT_PREL:
   case R_ARM_MOVT_ABS: {
-    u32 imm12 = bits(*(u32 *)loc, 11, 0);
-    u32 imm4 = bits(*(u32 *)loc, 19, 16);
+    u32 imm12 = bits(*(ul32 *)loc, 11, 0);
+    u32 imm4 = bits(*(ul32 *)loc, 19, 16);
     return sign_extend((imm4 << 12) | imm12, 15);
   }
   case R_ARM_PREL31:
-    return sign_extend(*(u32 *)loc, 30);
+    return sign_extend(*(ul32 *)loc, 30);
   case R_ARM_THM_MOVW_PREL_NC:
   case R_ARM_THM_MOVW_ABS_NC:
   case R_ARM_THM_MOVT_PREL:
   case R_ARM_THM_MOVT_ABS: {
-    u32 imm4 = bits(*(u16 *)loc, 3, 0);
-    u32 i = bit(*(u16 *)loc, 10);
-    u32 imm3 = bits(*(u16 *)(loc + 2), 14, 12);
-    u32 imm8 = bits(*(u16 *)(loc + 2), 7, 0);
+    u32 imm4 = bits(*(ul16 *)loc, 3, 0);
+    u32 i = bit(*(ul16 *)loc, 10);
+    u32 imm3 = bits(*(ul16 *)(loc + 2), 14, 12);
+    u32 imm8 = bits(*(ul16 *)(loc + 2), 7, 0);
     u32 val = (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
     return sign_extend(val, 15);
   }

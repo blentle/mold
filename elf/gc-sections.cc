@@ -102,11 +102,12 @@ collect_root_set(Context<E> &ctx) {
       // reduce the amount of non-memory-mapped segments, you should
       // use `strip` command, compile without debug info or use
       // -strip-all linker option.
-      if (!(isec->shdr().sh_flags & SHF_ALLOC))
+      u32 flags = isec->shdr().sh_flags;
+      if (!(flags & SHF_ALLOC))
         isec->extra().is_visited = true;
 
       if (is_init_fini(*isec) || is_c_identifier(isec->name()) ||
-          isec->shdr().sh_type == SHT_NOTE)
+          (flags & SHF_GNU_RETAIN) || isec->shdr().sh_type == SHT_NOTE)
         enqueue_section(isec.get());
     }
   });
@@ -201,10 +202,6 @@ void gc_sections(Context<E> &ctx) {
 #define INSTANTIATE(E)                                  \
   template void gc_sections(Context<E> &ctx);
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

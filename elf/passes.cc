@@ -68,6 +68,8 @@ void create_synthetic_sections(Context<E> &ctx) {
     ctx.buildid = push(new BuildIdSection<E>);
   if (ctx.arg.eh_frame_hdr)
     ctx.eh_frame_hdr = push(new EhFrameHdrSection<E>);
+  if (ctx.arg.gdb_index)
+    ctx.gdb_index = push(new GdbIndexSection<E>);
   if (ctx.arg.hash_style_sysv)
     ctx.hash = push(new HashSection<E>);
   if (ctx.arg.hash_style_gnu)
@@ -126,8 +128,6 @@ static void mark_live_objects(Context<E> &ctx) {
 
 template <typename E>
 void do_resolve_symbols(Context<E> &ctx) {
-  Timer t(ctx, "do_resolve_symbols");
-
   auto for_each_file = [&](std::function<void(InputFile<E> *)> fn) {
     tbb::parallel_for_each(ctx.objs, fn);
     tbb::parallel_for_each(ctx.dsos, fn);
@@ -161,7 +161,7 @@ void do_resolve_symbols(Context<E> &ctx) {
 
 template <typename E>
 void resolve_symbols(Context<E> &ctx) {
-  Timer t(ctx, "do_resolve_symbols");
+  Timer t(ctx, "resolve_symbols");
 
   std::vector<ObjectFile<E> *> objs = ctx.objs;
   std::vector<SharedFile<E> *> dsos = ctx.dsos;
@@ -205,7 +205,7 @@ void resolve_symbols(Context<E> &ctx) {
 
     tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
       file->clear_symbols();
-      file->is_alive = true;
+      file->is_alive = !file->is_needed;
     });
 
     do_resolve_symbols(ctx);
@@ -363,7 +363,8 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
   obj->priority = 1;
 
   auto add = [&](std::string_view name, u8 st_type = STT_NOTYPE) {
-    ElfSym<E> esym = {};
+    ElfSym<E> esym;
+    memset(&esym, 0, sizeof(esym));
     esym.st_type = st_type;
     esym.st_shndx = SHN_ABS;
     esym.st_bind = STB_GLOBAL;
@@ -429,7 +430,8 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
 
   for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
     Symbol<E> *sym = ctx.arg.defsyms[i].first;
-    ElfSym<E> esym = {};
+    ElfSym<E> esym;
+    memset(&esym, 0, sizeof(esym));
     esym.st_type = STT_NOTYPE;
     esym.st_shndx = SHN_ABS;
     esym.st_bind = STB_GLOBAL;
@@ -751,7 +753,7 @@ void shuffle_sections(Context<E> &ctx) {
     if (ctx.arg.shuffle_sections_seed)
       seed = *ctx.arg.shuffle_sections_seed;
     else
-      seed = std::random_device()();
+      seed = ((u64)std::random_device()() << 32) | std::random_device()();
 
     tbb::parallel_for_each(ctx.output_sections,
                            [&](std::unique_ptr<OutputSection<E>> &osec) {
@@ -1091,6 +1093,8 @@ void parse_symbol_version(Context<E> &ctx) {
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (i64 i = 0; i < file->symbols.size() - file->first_global; i++) {
+      // Match VERSION part of symbol foo@VERSION with version definitions.
+      // The symbols' VERSION parts are in file->symvers.
       if (!file->symvers[i])
         continue;
 
@@ -1116,6 +1120,16 @@ void parse_symbol_version(Context<E> &ctx) {
       sym->ver_idx = it->second;
       if (!is_default)
         sym->ver_idx |= VERSYM_HIDDEN;
+
+      // If both symbol `foo` and `foo@VERSION` are defined, `foo@VERSION`
+      // hides `foo` so that all references to `foo` are resolved to a
+      // versioned symbol. Likewise, if `foo@VERSION` and `foo@@VERSION` are
+      // defined, the default one takes precedence.
+      Symbol<E> *sym2 = get_symbol(ctx, sym->name());
+      if (sym2->file == file && !file->symvers[sym2->sym_idx - file->first_global])
+        if (sym2->ver_idx == ctx.default_version ||
+            (sym2->ver_idx & ~VERSYM_HIDDEN) == (sym->ver_idx & ~VERSYM_HIDDEN))
+          sym2->ver_idx = VER_NDX_LOCAL;
     }
   });
 }
@@ -1142,12 +1156,14 @@ void compute_import_export(Context<E> &ctx) {
           sym->ver_idx == VER_NDX_LOCAL)
         continue;
 
+      // If we are using a symbol in a DSO, we need to import it at runtime.
       if (sym->file != file && sym->file->is_dso) {
         std::scoped_lock lock(sym->mu);
         sym->is_imported = true;
         continue;
       }
 
+      // If we are creating a DSO, all global symbols are exported by default.
       if (sym->file == file) {
         std::scoped_lock lock(sym->mu);
         sym->is_exported = true;
@@ -1265,15 +1281,6 @@ i64 get_section_rank(Context<E> &ctx, Chunk<E> *chunk) {
          (!relro << 16) | (is_bss << 15);
 }
 
-// Returns the smallest number n such that
-// val <= n and n % align == skew % align.
-inline u64 align_with_skew(u64 val, u64 align, u64 skew) {
-  skew = skew % align;
-  u64 n = align_to(val + align - skew, align) - align + skew;
-  assert(val <= n && n < val + align && n % align == skew % align);
-  return n;
-}
-
 template <typename E>
 static bool is_tbss(Chunk<E> *chunk) {
   return (chunk->shdr.sh_type == SHT_NOBITS) && (chunk->shdr.sh_flags & SHF_TLS);
@@ -1283,6 +1290,10 @@ static bool is_tbss(Chunk<E> *chunk) {
 template <typename E>
 i64 do_set_osec_offsets(Context<E> &ctx) {
   std::vector<Chunk<E> *> &chunks = ctx.chunks;
+
+  auto alignment = [](Chunk<E> *chunk) {
+    return std::max<i64>(chunk->extra_addralign, chunk->shdr.sh_addralign);
+  };
 
   // Assign virtual addresses
   u64 addr = ctx.arg.image_base;
@@ -1294,15 +1305,12 @@ i64 do_set_osec_offsets(Context<E> &ctx) {
         it != ctx.arg.section_start.end())
       addr = it->second;
 
-    if (i > 0 && separate_page(ctx, chunks[i - 1], chunks[i]))
-      addr = align_to(addr, ctx.page_size);
-
     if (is_tbss(chunks[i])) {
       chunks[i]->shdr.sh_addr = addr;
       continue;
     }
 
-    addr = align_to(addr, chunks[i]->shdr.sh_addralign);
+    addr = align_to(addr, alignment(chunks[i]));
     chunks[i]->shdr.sh_addr = addr;
     addr += chunks[i]->shdr.sh_size;
   }
@@ -1319,7 +1327,7 @@ i64 do_set_osec_offsets(Context<E> &ctx) {
     if (is_tbss(chunks[i])) {
       u64 addr = chunks[i]->shdr.sh_addr;
       for (; i < chunks.size() && is_tbss(chunks[i]); i++) {
-        addr = align_to(addr, chunks[i]->shdr.sh_addralign);
+        addr = align_to(addr, alignment(chunks[i]));
         chunks[i]->shdr.sh_addr = addr;
         addr += chunks[i]->shdr.sh_size;
       }
@@ -1328,16 +1336,42 @@ i64 do_set_osec_offsets(Context<E> &ctx) {
     }
   }
 
-  // Assign file offsets
+  // Assign file offsets to memory-allocated sections.
   u64 fileoff = 0;
-  for (Chunk<E> *chunk : chunks) {
-    if (chunk->shdr.sh_type == SHT_NOBITS) {
-      chunk->shdr.sh_offset = fileoff;
-    } else {
-      fileoff = align_with_skew(fileoff, ctx.page_size, chunk->shdr.sh_addr);
-      chunk->shdr.sh_offset = fileoff;
-      fileoff += chunk->shdr.sh_size;
+  i64 i = 0;
+
+  while (i < chunks.size() && (chunks[i]->shdr.sh_flags & SHF_ALLOC)) {
+    Chunk<E> &first = *chunks[i];
+    assert(first.shdr.sh_type != SHT_NOBITS);
+
+    fileoff = align_to(fileoff, alignment(&first));
+
+    u64 end = fileoff;
+    while (i < chunks.size() && (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
+           chunks[i]->shdr.sh_type != SHT_NOBITS) {
+      // The addresses may not increase monotonically if a user uses
+      // --start-sections.
+      if (chunks[i]->shdr.sh_addr < first.shdr.sh_addr)
+        break;
+
+      chunks[i]->shdr.sh_offset =
+        fileoff + chunks[i]->shdr.sh_addr - first.shdr.sh_addr;
+      end = chunks[i]->shdr.sh_offset + chunks[i]->shdr.sh_size;
+      i++;
     }
+
+    fileoff = end;
+
+    while (i < chunks.size() && (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
+           chunks[i]->shdr.sh_type == SHT_NOBITS)
+      i++;
+  }
+
+  // Assign file offsets to non-memory-allocated sections.
+  for (; i < chunks.size(); i++) {
+    fileoff = align_to(fileoff, chunks[i]->shdr.sh_addralign);
+    chunks[i]->shdr.sh_offset = fileoff;
+    fileoff += chunks[i]->shdr.sh_size;
   }
   return fileoff;
 }
@@ -1443,7 +1477,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
 
   // _end, _etext, _edata and the like
   for (Chunk<E> *chunk : ctx.chunks) {
-    if (chunk->is_header())
+    if (chunk->kind() == HEADER)
       continue;
 
     if (chunk->shdr.sh_flags & SHF_ALLOC) {
@@ -1652,10 +1686,6 @@ void write_dependency_file(Context<E> &ctx) {
   template i64 compress_debug_sections(Context<E> &);                   \
   template void write_dependency_file(Context<E> &);
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

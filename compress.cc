@@ -89,7 +89,8 @@ static std::vector<u8> do_compress(std::string_view input) {
   return buf;
 }
 
-ZlibCompressor::ZlibCompressor(std::string_view input) {
+ZlibCompressor::ZlibCompressor(u8 *buf, i64 size) {
+  std::string_view input{(char *)buf, (size_t)size};
   std::vector<std::string_view> inputs = split(input);
   std::vector<u64> adlers(inputs.size());
   shards.resize(inputs.size());
@@ -134,7 +135,7 @@ void ZlibCompressor::write_to(u8 *buf) {
   end[-5] = 0;
 
   // Write a checksum
-  *(ubig32 *)(end - 4) = checksum;
+  *(ub32 *)(end - 4) = checksum;
 }
 
 GzipCompressor::GzipCompressor(std::string_view input) {
@@ -183,10 +184,10 @@ void GzipCompressor::write_to(u8 *buf) {
 
   // Write a trailer
   u8 *end = buf + size();
-  end[-10] = 0x3; // two-byte zlib stream terminator
+  end[-10] = 3; // two-byte zlib stream terminator
   end[-9] = 0;
-  *(u32 *)(end - 8) = checksum;
-  *(u32 *)(end - 4) = uncompressed_size;
+  *(ul32 *)(end - 8) = checksum;
+  *(ul32 *)(end - 4) = uncompressed_size;
 }
 
 } // namespace mold
