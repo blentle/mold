@@ -2,6 +2,7 @@
 
 #include "inttypes.h"
 
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cassert>
@@ -279,6 +280,10 @@ inline u64 read_uleb(u8 *&buf) {
   return val;
 }
 
+inline u64 read_uleb(u8 const*&buf) {
+  return read_uleb(const_cast<u8 *&>(buf));
+}
+
 inline i64 uleb_size(u64 val) {
   i64 i = 0;
   do {
@@ -397,6 +402,30 @@ private:
 };
 
 //
+// output-file.h
+//
+
+template <typename C>
+class OutputFile {
+public:
+  static std::unique_ptr<OutputFile<C>>
+  open(C &ctx, std::string path, i64 filesize, i64 perm);
+
+  virtual void close(C &ctx) = 0;
+  virtual ~OutputFile() = default;
+
+  u8 *buf = nullptr;
+  std::string path;
+  i64 filesize;
+  bool is_mmapped;
+  bool is_unmapped = false;
+
+protected:
+  OutputFile(std::string path, i64 filesize, bool is_mmapped)
+    : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
+};
+
+//
 // hyperloglog.cc
 //
 
@@ -421,6 +450,12 @@ private:
 
   std::vector<std::atomic_uint8_t> buckets;
 };
+
+//
+// uuid.cc
+//
+
+std::array<u8, 16> get_uuid_v4();
 
 //
 // filepath.cc

@@ -14,6 +14,22 @@ std::ostream &operator<<(std::ostream &out, const InputFile<E> &file) {
 }
 
 template <typename E>
+void InputFile<E>::clear_symbols() {
+  for (Symbol<E> *sym : syms) {
+    std::scoped_lock lock(sym->mu);
+    if (sym->file == this) {
+      sym->file = nullptr;
+      sym->is_extern = false;
+      sym->is_imported = false;
+      sym->subsec = nullptr;
+      sym->value = 0;
+      sym->is_common = false;
+      sym->is_weak_def = false;
+    }
+  }
+}
+
+template <typename E>
 ObjectFile<E> *
 ObjectFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf,
                       std::string archive_name) {
@@ -28,6 +44,19 @@ ObjectFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf,
 
 template <typename E>
 void ObjectFile<E>::parse(Context<E> &ctx) {
+  if (get_file_type(this->mf) == FileType::LLVM_BITCODE) {
+    // Open an compiler IR file
+    load_lto_plugin(ctx);
+    this->lto_module =
+      ctx.lto.module_create_from_memory(this->mf->data, this->mf->size);
+    if (!this->lto_module)
+      Fatal(ctx) << *this << ": lto_module_create_from_memory failed";
+
+    // Read a symbol table
+    parse_lto_symbols(ctx);
+    return;
+  }
+
   parse_sections(ctx);
   parse_symbols(ctx);
   split_subsections(ctx);
@@ -63,6 +92,11 @@ void ObjectFile<E>::parse_sections(Context<E> &ctx) {
         unwind_sec = &msec;
         continue;
       }
+
+      // Ignore __eh_frame as its role is superceded by __compact_unwind.
+      // I'm not sure if this is the right thing to do, though.
+      if (msec.match("__TEXT", "__eh_frame"))
+        continue;
 
       if (msec.attr & S_ATTR_DEBUG)
         continue;
@@ -101,6 +135,7 @@ void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
       sym.subsec = nullptr;
       sym.is_extern = false;
       sym.is_common = false;
+      sym.is_weak_def = false;
 
       switch (msym.type) {
       case N_UNDF:
@@ -300,9 +335,12 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx, MachSection &hdr) {
       Fatal(ctx) << *this << ": __compact_unwind: unsupported relocation: " << i;
     };
 
+    if (r.is_pcrel || r.p2size != 3 || r.type)
+      error();
+
     switch (r.offset % sizeof(CompactUnwindEntry)) {
     case offsetof(CompactUnwindEntry, code_start): {
-      if (r.is_pcrel || r.p2size != 3 || r.is_extern || r.type)
+      if (r.is_extern)
         error();
 
       Subsection<E> *target = find_subsection(ctx, src[idx].code_start);
@@ -313,12 +351,12 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx, MachSection &hdr) {
       break;
     }
     case offsetof(CompactUnwindEntry, personality):
-      if (r.is_pcrel || r.p2size != 3 || !r.is_extern || r.type)
+      if (!r.is_extern)
         error();
       dst.personality = this->syms[r.idx];
       break;
     case offsetof(CompactUnwindEntry, lsda): {
-      if (r.is_pcrel || r.p2size != 3 || r.is_extern || r.type)
+      if (r.is_extern)
         error();
 
       i32 addr = *(il32 *)((u8 *)this->mf->data + hdr.offset + r.offset);
@@ -330,7 +368,7 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx, MachSection &hdr) {
       break;
     }
     default:
-      Fatal(ctx) << *this << ": __compact_unwind: unsupported relocation: " << i;
+      error();
     }
   }
 
@@ -360,22 +398,31 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx, MachSection &hdr) {
 // Symbols with higher priorities overwrites symbols with lower priorities.
 // Here is the list of priorities, from the highest to the lowest.
 //
-//  1. Defined symbol
-//  2. Defined symbol in a DSO/archive
-//  3. Common symbol
-//  4. Common symbol in an archive
-//  5. Unclaimed (nonexistent) symbol
+//  1. Strong defined symbol
+//  2. Weak defined symbol
+//  3. Strong defined symbol in a DSO/archive
+//  4. Weak Defined symbol in a DSO/archive
+//  5. Common symbol
+//  6. Common symbol in an archive
+//  7. Unclaimed (nonexistent) symbol
 //
 // Ties are broken by file priority.
 template <typename E>
-static u64 get_rank(InputFile<E> *file, bool is_common, bool is_lazy) {
+static u64 get_rank(InputFile<E> *file, bool is_common, bool is_weak,
+                    bool is_lazy) {
   if (is_common) {
     if (is_lazy)
+      return (6 << 24) + file->priority;
+    return (5 << 24) + file->priority;
+  }
+
+  if (file->is_dylib || is_lazy) {
+    if (is_weak)
       return (4 << 24) + file->priority;
     return (3 << 24) + file->priority;
   }
 
-  if (file->is_dylib || is_lazy)
+  if (is_weak)
     return (2 << 24) + file->priority;
   return (1 << 24) + file->priority;
 }
@@ -383,8 +430,8 @@ static u64 get_rank(InputFile<E> *file, bool is_common, bool is_lazy) {
 template <typename E>
 static u64 get_rank(Symbol<E> &sym) {
   if (!sym.file)
-    return 5 << 24;
-  return get_rank(sym.file, sym.is_common, !sym.file->is_alive);
+    return 7 << 24;
+  return get_rank(sym.file, sym.is_common, sym.is_weak_def, !sym.file->is_alive);
 }
 
 template <typename E>
@@ -397,10 +444,12 @@ void ObjectFile<E>::resolve_symbols(Context<E> &ctx) {
     Symbol<E> &sym = *this->syms[i];
     std::scoped_lock lock(sym.mu);
 
-    if (get_rank(this, msym.is_common(), false) < get_rank(sym)) {
+    if (get_rank(this, msym.is_common(), msym.desc & N_WEAK_DEF, false) <
+        get_rank(sym)) {
       sym.file = this;
       sym.is_extern = (msym.ext && !this->is_hidden);
       sym.is_imported = false;
+      sym.is_weak_def = (msym.desc & N_WEAK_DEF);
 
       switch (msym.type) {
       case N_UNDF:
@@ -483,6 +532,7 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
       sym.subsec = subsec;
       sym.value = 0;
       sym.is_common = false;
+      sym.is_weak_def = false;
     }
   }
 }
@@ -492,7 +542,8 @@ void ObjectFile<E>::check_duplicate_symbols(Context<E> &ctx) {
   for (i64 i = 0; i < this->syms.size(); i++) {
     Symbol<E> *sym = this->syms[i];
     MachSym &msym = mach_syms[i];
-    if (sym && !msym.is_undef() && !msym.is_common() && sym->file != this)
+    if (sym && sym->file && sym->file != this && !msym.is_undef() &&
+        !msym.is_common() && !(msym.desc & N_WEAK_DEF))
       Error(ctx) << "duplicate symbol: " << *this << ": " << *sym->file
                  << ": " << *sym;
   }
@@ -513,6 +564,55 @@ InputSection<E> *ObjectFile<E>::get_common_sec(Context<E> &ctx) {
     sections.emplace_back(common_sec);
   }
   return common_sec;
+}
+
+template <typename E>
+void ObjectFile<E>::parse_lto_symbols(Context<E> &ctx) {
+  i64 nsyms = ctx.lto.module_get_num_symbols(this->lto_module);
+  this->syms.reserve(nsyms);
+  this->mach_syms2.reserve(nsyms);
+
+  for (i64 i = 0; i < nsyms; i++) {
+    std::string_view name = ctx.lto.module_get_symbol_name(this->lto_module, i);
+    this->syms.push_back(get_symbol(ctx, name));
+
+    u32 attr = ctx.lto.module_get_symbol_attribute(this->lto_module, i);
+
+    MachSym msym = {};
+    msym.p2align = (attr & LTO_SYMBOL_ALIGNMENT_MASK);
+
+    switch (attr & LTO_SYMBOL_DEFINITION_MASK) {
+    case LTO_SYMBOL_DEFINITION_REGULAR:
+    case LTO_SYMBOL_DEFINITION_TENTATIVE:
+    case LTO_SYMBOL_DEFINITION_WEAK:
+      msym.type = N_ABS;
+      break;
+    case LTO_SYMBOL_DEFINITION_UNDEFINED:
+    case LTO_SYMBOL_DEFINITION_WEAKUNDEF:
+      msym.type = N_UNDF;
+      break;
+    default:
+      unreachable();
+    }
+
+    switch (attr & LTO_SYMBOL_SCOPE_MASK) {
+    case 0:
+    case LTO_SYMBOL_SCOPE_INTERNAL:
+    case LTO_SYMBOL_SCOPE_HIDDEN:
+      break;
+    case LTO_SYMBOL_SCOPE_DEFAULT:
+    case LTO_SYMBOL_SCOPE_PROTECTED:
+    case LTO_SYMBOL_SCOPE_DEFAULT_CAN_BE_HIDDEN:
+      msym.ext = true;
+      break;
+    default:
+      unreachable();
+    }
+
+    mach_syms2.push_back(msym);
+  }
+
+  mach_syms = mach_syms2;
 }
 
 template <typename E>
@@ -584,8 +684,30 @@ void DylibFile<E>::parse(Context<E> &ctx) {
   switch (get_file_type(this->mf)) {
   case FileType::TAPI: {
     TextDylib tbd = parse_tbd(ctx, this->mf);
-    for (std::string_view sym : tbd.exports)
-      this->syms.push_back(get_symbol(ctx, sym));
+
+    for (std::string_view s : tbd.exports)
+      this->syms.push_back(get_symbol(ctx, s));
+
+    for (std::string_view s : tbd.weak_exports) {
+      this->syms.push_back(get_symbol(ctx, s));
+      this->syms.back()->is_weak_def = true;
+    }
+
+    auto add_symbol = [&](const std::string &name) {
+      this->syms.push_back(get_symbol(ctx, save_string(ctx, name)));
+    };
+
+    for (std::string_view s : tbd.objc_classes) {
+      add_symbol("_OBJC_CLASS_$_" + std::string(s));
+      add_symbol("_OBJC_METACLASS_$_" + std::string(s));
+    }
+
+    for (std::string_view s : tbd.objc_eh_types)
+      add_symbol("_OBJC_EHTYPE_$_" + std::string(s));
+
+    for (std::string_view s : tbd.objc_ivars)
+      add_symbol("_OBJC_IVAR_$_" + std::string(s));
+
     install_name = tbd.install_name;
     break;
   }
@@ -602,18 +724,20 @@ void DylibFile<E>::resolve_symbols(Context<E> &ctx) {
   for (Symbol<E> *sym : this->syms) {
     std::scoped_lock lock(sym->mu);
 
-    if (!sym->file || this->priority < sym->file->priority) {
+    if (get_rank(this, false, false, false) < get_rank(*sym)) {
       sym->file = this;
       sym->is_extern = true;
       sym->is_imported = true;
       sym->subsec = nullptr;
       sym->value = 0;
       sym->is_common = false;
+      sym->is_weak_def = false;
     }
   }
 }
 
 #define INSTANTIATE(E)                                                  \
+  template class InputFile<E>;                                          \
   template class ObjectFile<E>;                                         \
   template class DylibFile<E>;                                          \
   template std::ostream &operator<<(std::ostream &, const InputFile<E> &)

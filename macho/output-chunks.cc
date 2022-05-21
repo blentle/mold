@@ -106,6 +106,9 @@ static std::vector<u8> create_uuid_cmd(Context<E> &ctx) {
 
   cmd.cmd = LC_UUID;
   cmd.cmdsize = buf.size();
+
+  assert(sizeof(cmd.uuid) == sizeof(ctx.uuid));
+  memcpy(cmd.uuid, ctx.uuid, sizeof(cmd.uuid));
   return buf;
 }
 
@@ -206,17 +209,14 @@ static std::vector<u8> create_data_in_code_cmd(Context<E> &ctx) {
 
 template <typename E>
 static std::vector<u8> create_id_dylib_cmd(Context<E> &ctx) {
-  std::vector<u8> buf(sizeof(DylibCommand) + ctx.arg.output.size() + 1);
+  std::vector<u8> buf(sizeof(DylibCommand) +
+                      align_to(ctx.arg.final_output.size() + 1, 8));
   DylibCommand &cmd = *(DylibCommand *)buf.data();
-
-  std::string_view name = ctx.arg.install_name;
-  if (name.empty())
-    name = ctx.arg.output;
 
   cmd.cmd = LC_ID_DYLIB;
   cmd.cmdsize = buf.size();
   cmd.nameoff = sizeof(cmd);
-  write_string(buf.data() + sizeof(cmd), name);
+  write_string(buf.data() + sizeof(cmd), ctx.arg.final_output);
   return buf;
 }
 
@@ -270,7 +270,8 @@ static std::vector<std::vector<u8>> create_load_commands(Context<E> &ctx) {
   vec.push_back(create_dyld_info_only_cmd(ctx));
   vec.push_back(create_symtab_cmd(ctx));
   vec.push_back(create_dysymtab_cmd(ctx));
-  vec.push_back(create_uuid_cmd(ctx));
+  if (ctx.arg.uuid != UUID_NONE)
+    vec.push_back(create_uuid_cmd(ctx));
   vec.push_back(create_build_version_cmd(ctx));
   vec.push_back(create_source_version_cmd(ctx));
   vec.push_back(create_function_starts_cmd(ctx));
@@ -343,6 +344,25 @@ void OutputMachHeader<E>::copy_buf(Context<E> &ctx) {
 }
 
 template <typename E>
+void OutputMachHeader<E>::write_uuid(Context<E> &ctx) {
+  switch (ctx.arg.uuid) {
+  case UUID_RANDOM:
+    memcpy(ctx.uuid, get_uuid_v4().data(), 16);
+    break;
+  case UUID_HASH: {
+    u8 buf[SHA256_SIZE];
+    SHA256(ctx.buf, ctx.output_file->filesize, buf);
+    memcpy(ctx.uuid, buf, 16);
+    break;
+  }
+  default:
+    unreachable();
+  }
+
+  copy_buf(ctx);
+}
+
+template <typename E>
 OutputSection<E> *
 OutputSection<E>::get_instance(Context<E> &ctx, std::string_view segname,
                                std::string_view sectname) {
@@ -370,7 +390,7 @@ OutputSection<E>::get_instance(Context<E> &ctx, std::string_view segname,
     return osec;
 
   OutputSection<E> *osec = new OutputSection<E>(ctx, segname, sectname);
-  ctx.osec_pool.emplace_back(osec);
+  ctx.chunk_pool.emplace_back(osec);
   return osec;
 }
 
@@ -459,8 +479,11 @@ void OutputSegment<E>::set_offset(Context<E> &ctx, i64 fileoff, u64 vmaddr) {
 
   while (i < chunks.size() && chunks[i]->hdr.type != S_ZEROFILL) {
     Chunk<E> &sec = *chunks[i++];
-    fileoff = align_to(fileoff, 1 << sec.hdr.p2align);
-    vmaddr = align_to(vmaddr, 1 << sec.hdr.p2align);
+    i64 alignment =
+      (sec.hdr.type == S_THREAD_LOCAL_VARIABLES) ? 8 : (1 << sec.hdr.p2align);
+
+    fileoff = align_to(fileoff, alignment);
+    vmaddr = align_to(vmaddr, alignment);
 
     sec.hdr.offset = fileoff;
     sec.hdr.addr = vmaddr;
@@ -473,7 +496,11 @@ void OutputSegment<E>::set_offset(Context<E> &ctx, i64 fileoff, u64 vmaddr) {
   while (i < chunks.size()) {
     Chunk<E> &sec = *chunks[i++];
     assert(sec.hdr.type == S_ZEROFILL);
-    vmaddr = align_to(vmaddr, 1 << sec.hdr.p2align);
+
+    i64 alignment =
+      (sec.hdr.type == S_THREAD_LOCAL_VARIABLES) ? 8 : (1 << sec.hdr.p2align);
+
+    vmaddr = align_to(vmaddr, alignment);
     sec.hdr.addr = vmaddr;
     sec.compute_size(ctx);
     vmaddr += sec.hdr.size;
@@ -553,6 +580,7 @@ void RebaseEncoder::flush() {
 void RebaseEncoder::finish() {
   flush();
   buf.push_back(REBASE_OPCODE_DONE);
+  buf.resize(align_to(buf.size(), 8));
 }
 
 template <typename E>
@@ -585,7 +613,7 @@ void RebaseSection<E>::compute_size(Context<E> &ctx) {
 
   enc.finish();
   contents = std::move(enc.buf);
-  this->hdr.size = align_to(contents.size(), 8);
+  this->hdr.size = contents.size();
 }
 
 template <typename E>
@@ -632,6 +660,7 @@ void BindEncoder::add(i64 dylib_idx, std::string_view sym, i64 flags,
 
 void BindEncoder::finish() {
   buf.push_back(BIND_OPCODE_DONE);
+  buf.resize(align_to(buf.size(), 8));
 }
 
 template <typename E>
@@ -650,10 +679,19 @@ void BindSection<E>::compute_size(Context<E> &ctx) {
               ctx.data_seg->seg_idx,
               sym->get_tlv_addr(ctx) - ctx.data_seg->cmd.vmaddr);
 
-  enc.finish();
+  for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
+    for (Chunk<E> *chunk : seg->chunks)
+      if (chunk->is_output_section)
+        for (Subsection<E> *subsec : ((OutputSection<E> *)chunk)->members)
+          for (Relocation<E> &r : subsec->get_rels())
+            if (r.needs_dynrel)
+              enc.add(((DylibFile<E> *)r.sym->file)->dylib_idx, r.sym->name, 0,
+                      seg->seg_idx,
+                      subsec->get_addr(ctx) + r.offset - seg->cmd.vmaddr);
 
-  contents = enc.buf;
-  this->hdr.size = align_to(contents.size(), 8);
+  enc.finish();
+  contents = std::move(enc.buf);
+  this->hdr.size = contents.size();
 }
 
 template <typename E>
@@ -701,7 +739,8 @@ void LazyBindSection<E>::compute_size(Context<E> &ctx) {
     add(ctx, *sym, 0);
   }
 
-  this->hdr.size = align_to(contents.size(), 1 << this->hdr.p2align);
+  contents.resize(align_to(contents.size(), 1 << this->hdr.p2align));
+  this->hdr.size = contents.size();
 }
 
 template <typename E>
@@ -825,7 +864,9 @@ void ExportSection<E>::compute_size(Context<E> &ctx) {
 
 template <typename E>
 void ExportSection<E>::copy_buf(Context<E> &ctx) {
-  enc.write_trie(ctx.buf + this->hdr.offset);
+  u8 *buf = ctx.buf + this->hdr.offset;
+  memset(buf, 0, this->hdr.size);
+  enc.write_trie(buf);
 }
 
 template <typename E>
@@ -967,7 +1008,7 @@ void IndirectSymtabSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void CodeSignatureSection<E>::compute_size(Context<E> &ctx) {
-  std::string filename = filepath(ctx.arg.output).filename();
+  std::string filename = filepath(ctx.arg.final_output).filename();
   i64 filename_size = align_to(filename.size() + 1, 16);
   i64 num_blocks = align_to(this->hdr.offset, BLOCK_SIZE) / BLOCK_SIZE;
   this->hdr.size = sizeof(CodeSignatureHeader) + sizeof(CodeSignatureBlobIndex) +
@@ -980,7 +1021,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
   u8 *buf = ctx.buf + this->hdr.offset;
   memset(buf, 0, this->hdr.size);
 
-  std::string filename = filepath(ctx.arg.output).filename();
+  std::string filename = filepath(ctx.arg.final_output).filename();
   i64 filename_size = align_to(filename.size() + 1, 16);
   i64 num_blocks = align_to(this->hdr.offset, BLOCK_SIZE) / BLOCK_SIZE;
 
@@ -1077,6 +1118,18 @@ void StubsSection<E>::add(Context<E> &ctx, Symbol<E> *sym) {
     E::stub_helper_hdr_size + nsyms * E::stub_helper_size;
   ctx.lazy_symbol_ptr.hdr.size = nsyms * E::word_size;
 }
+
+template <typename E>
+class UnwindEncoder {
+public:
+  std::vector<u8> encode(Context<E> &ctx, std::span<UnwindRecord<E>> records);
+  u32 encode_personality(Context<E> &ctx, Symbol<E> *sym);
+
+  std::vector<std::span<UnwindRecord<E>>>
+  split_records(std::span<UnwindRecord<E>> records);
+
+  std::vector<Symbol<E> *> personalities;
+};
 
 template <typename E>
 std::vector<u8>
@@ -1222,8 +1275,7 @@ static std::vector<u8> construct_unwind_info(Context<E> &ctx) {
       if (chunk->is_output_section)
         for (Subsection<E> *subsec : ((OutputSection<E> *)chunk)->members)
           for (UnwindRecord<E> &rec : subsec->get_unwind_records())
-            if (!ctx.arg.dead_strip || rec.is_alive)
-              records.push_back(rec);
+            records.push_back(rec);
 
   if (records.empty())
     return {};
@@ -1275,10 +1327,17 @@ void ThreadPtrsSection<E>::add(Context<E> &ctx, Symbol<E> *sym) {
 
 template <typename E>
 void ThreadPtrsSection<E>::copy_buf(Context<E> &ctx) {
-  u64 *buf = (u64 *)(ctx.buf + this->hdr.offset);
+  ul64 *buf = (ul64 *)(ctx.buf + this->hdr.offset);
+  memset(buf, 0, this->hdr.size);
+
   for (i64 i = 0; i < syms.size(); i++)
-    if (!syms[i]->is_imported)
-      buf[i] = syms[i]->get_addr(ctx);
+    if (Symbol<E> &sym = *syms[i]; !sym.is_imported)
+      buf[i] = sym.get_addr(ctx);
+}
+
+template <typename E>
+void SectCreateSection<E>::copy_buf(Context<E> &ctx) {
+  write_string(ctx.buf + this->hdr.offset, contents);
 }
 
 #define INSTANTIATE(E)                                  \
@@ -1297,11 +1356,11 @@ void ThreadPtrsSection<E>::copy_buf(Context<E> &ctx) {
   template class DataInCodeSection<E>;                  \
   template class StubsSection<E>;                       \
   template class StubHelperSection<E>;                  \
-  template class UnwindEncoder<E>;                      \
   template class UnwindInfoSection<E>;                  \
   template class GotSection<E>;                         \
   template class LazySymbolPtrSection<E>;               \
-  template class ThreadPtrsSection<E>
+  template class ThreadPtrsSection<E>;                  \
+  template class SectCreateSection<E>
 
 INSTANTIATE_ALL;
 

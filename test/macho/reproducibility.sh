@@ -10,32 +10,22 @@ MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
+t=out/test/macho/$testname
 mkdir -p $t
 
 cat <<EOF | $CC -o $t/a.o -c -xc -
-void expfn1() {}
-void expfn2() {}
-void foo();
-
+#include <stdio.h>
 int main() {
-  expfn1();
-  expfn2();
-  foo();
+  printf("Hello world\n");
 }
 EOF
 
-cat <<EOF | $CC -shared -fPIC -o $t/b.so -xc -
-void expfn1();
-void expfn2() {}
+clang --ld-path=./ld64 -o $t/exe $t/a.o
+cp $t/exe $t/exe1
 
-void foo() {
-  expfn1();
-}
-EOF
+clang --ld-path=./ld64 -o $t/exe $t/a.o
+cp $t/exe $t/exe2
 
-$CC -B. -o $t/exe $t/a.o $t/b.so
-readelf --dyn-syms $t/exe | grep -q expfn2
-readelf --dyn-syms $t/exe | grep -q expfn1
+diff $t/exe1 $t/exe2
 
 echo OK

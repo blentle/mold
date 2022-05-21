@@ -33,7 +33,9 @@ Options:
   -dynamic                    Link against dylibs (default)
   -e <SYMBOL>                 Specify the entry point of a main executable
   -execute                    Produce an executable (default)
+  -export_dynamic             Preserves all global symbols in main executables during LTO
   -filelist <FILE>[,<DIR>]    Specify the list of input file names
+  -final_output <NAME>
   -force_load <FILE>          Include all objects from a given static archive
   -framework <NAME>,[,<SUFFIX>]
                               Search for a given framework
@@ -51,15 +53,18 @@ Options:
   -needed-framework <NAME>[,<SUFFIX>]
                               Search for a given framework
   -no_deduplicate             Ignored
+  -no_uuid                    Do not generate an LC_UUID load command
   -o <FILE>                   Set output filename
   -pagezero_size <SIZE>       Specify the size of the __PAGEZERO segment
   -platform_version <PLATFORM> <MIN_VERSION> <SDK_VERSION>
                               Set platform, platform version and SDK version
+  -random_uuid                Generate a random LC_UUID load command
   -rpath <PATH>               Add PATH to the runpath search path list
+  -search_dylibs_first
+  -search_paths_first
+  -sectcreate <SEGNAME> <SECTNAME> <FILE>
   -stack_size <SIZE>
   -syslibroot <DIR>           Prepend DIR to library search paths
-  -search_paths_first
-  -search_dylibs_first
   -t                          Print out each file the linker loads
   -v                          Report version information)";
 
@@ -244,10 +249,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.entry = arg;
     } else if (read_flag("-execute")) {
       ctx.output_type = MH_EXECUTE;
+    } else if (read_flag("-export_dynamic")) {
+      ctx.arg.export_dynamic = true;
     } else if (read_arg("-fatal_warnings")) {
     } else if (read_arg("-filelist")) {
       remaining.push_back("-filelist");
       remaining.push_back(std::string(arg));
+    } else if (read_arg("-final_output")) {
+      ctx.arg.final_output = arg;
     } else if (read_arg("-force_load")) {
       remaining.push_back("-force_load");
       remaining.push_back(std::string(arg));
@@ -255,6 +264,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       remaining.push_back("-framework");
       remaining.push_back(std::string(arg));
     } else if (read_arg("-lto_library")) {
+      ctx.arg.lto_library = arg;
     } else if (read_arg("-macos_version_min")) {
       ctx.arg.platform = PLATFORM_MACOS;
       ctx.arg.platform_min_version = parse_version(ctx, arg);
@@ -268,6 +278,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       remaining.push_back(std::string(arg));
     } else if (read_arg("-map")) {
       ctx.arg.map = arg;
+    } else if (read_arg("-mllvm")) {
+      ctx.arg.mllvm.push_back(std::string(arg));
     } else if (read_joined("-needed-l")) {
       remaining.push_back("-needed-l");
       remaining.push_back(std::string(arg));
@@ -275,6 +287,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       remaining.push_back("-needed_framework");
       remaining.push_back(std::string(arg));
     } else if (read_flag("-no_deduplicate")) {
+    } else if (read_flag("-no_uuid")) {
+      ctx.arg.uuid = UUID_NONE;
     } else if (read_arg("-o")) {
       ctx.arg.output = arg;
     } else if (read_hex("-pagezero_size")) {
@@ -283,16 +297,20 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.platform = parse_platform(ctx, arg);
       ctx.arg.platform_min_version = parse_version(ctx, arg2);
       ctx.arg.platform_sdk_version = parse_version(ctx, arg3);
+    } else if (read_flag("-random_uuid")) {
+      ctx.arg.uuid = UUID_RANDOM;
     } else if (read_arg("-rpath")) {
       ctx.arg.rpath.push_back(std::string(arg));
-    } else if (read_hex("-stack_size")) {
-      ctx.arg.stack_size = hex_arg;
-    } else if (read_arg("-syslibroot")) {
-      ctx.arg.syslibroot.push_back(std::string(arg));
     } else if (read_flag("-search_paths_first")) {
       ctx.arg.search_paths_first = true;
     } else if (read_flag("-search_dylibs_first")) {
       ctx.arg.search_paths_first = false;
+    } else if (read_arg3("-sectcreate")) {
+      ctx.arg.sectcreate.push_back({arg, arg2, arg3});
+    } else if (read_hex("-stack_size")) {
+      ctx.arg.stack_size = hex_arg;
+    } else if (read_arg("-syslibroot")) {
+      ctx.arg.syslibroot.push_back(std::string(arg));
     } else if (read_flag("-t")) {
       ctx.arg.trace = true;
     } else if (read_flag("-v")) {
@@ -347,6 +365,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     ctx.arg.pagezero_size = *pagezero_size;
   } else {
     ctx.arg.pagezero_size = (ctx.output_type == MH_EXECUTE) ? 0x100000000 : 0;
+  }
+
+  if (ctx.arg.final_output == "") {
+    if (ctx.arg.install_name != "")
+      ctx.arg.final_output = ctx.arg.install_name;
+    else
+      ctx.arg.final_output = ctx.arg.output;
   }
 
   return remaining;

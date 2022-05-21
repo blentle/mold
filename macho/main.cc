@@ -1,6 +1,7 @@
 #include "mold.h"
 #include "../archive-file.h"
 #include "../cmdline.h"
+#include "../output-file.h"
 
 #include <cstdlib>
 #include <fcntl.h>
@@ -18,6 +19,41 @@ split_string(std::string_view str, char sep) {
   if (pos == str.npos)
     return {str, ""};
   return {str.substr(0, pos), str.substr(pos + 1)};
+}
+
+template <typename E>
+static bool has_lto_obj(Context<E> &ctx) {
+  for (ObjectFile<E> *file : ctx.objs)
+    if (file->lto_module)
+      return true;
+  return false;
+}
+
+template <typename E>
+static void resolve_symbols(Context<E> &ctx) {
+  std::vector<InputFile<E> *> files;
+  append(files, ctx.objs);
+  append(files, ctx.dylibs);
+
+  for (InputFile<E> *file : files)
+    file->resolve_symbols(ctx);
+
+  std::vector<ObjectFile<E> *> live_objs;
+  for (ObjectFile<E> *file : ctx.objs)
+    if (file->is_alive)
+      live_objs.push_back(file);
+
+  for (i64 i = 0; i < live_objs.size(); i++) {
+    live_objs[i]->mark_live_objects(ctx, [&](ObjectFile<E> *file) {
+      live_objs.push_back(file);
+    });
+  }
+
+  for (InputFile<E> *file : files)
+    file->resolve_symbols(ctx);
+
+  if (has_lto_obj(ctx))
+    do_lto(ctx);
 }
 
 template <typename E>
@@ -52,6 +88,8 @@ static void create_internal_file(Context<E> &ctx) {
   default:
     unreachable();
   }
+
+  add("___dso_handle");
 }
 
 template <typename E>
@@ -185,8 +223,8 @@ static void create_synthetic_chunks(Context<E> &ctx) {
 template <typename E>
 static void scan_unwind_info(Context<E> &ctx) {
   for (ObjectFile<E> *file : ctx.objs)
-    for (UnwindRecord<E> &rec : file->unwind_records)
-      if (!ctx.arg.dead_strip || rec.is_alive)
+    for (std::unique_ptr<Subsection<E>> &subsec : file->subsections)
+      for (UnwindRecord<E> &rec : subsec->get_unwind_records())
         if (rec.personality)
           rec.personality->flags |= NEEDS_GOT;
 }
@@ -239,11 +277,25 @@ static i64 assign_offsets(Context<E> &ctx) {
   return fileoff;
 }
 
+// An address of a symbol of type S_THREAD_LOCAL_VARIABLES is computed
+// as a relative address to the beginning of the first thread-local
+// section. This function finds the beginnning address.
+template <typename E>
+static u64 get_tls_begin(Context<E> &ctx) {
+  for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
+    for (Chunk<E> *chunk : seg->chunks)
+      if (chunk->hdr.type == S_THREAD_LOCAL_REGULAR ||
+          chunk->hdr.type == S_THREAD_LOCAL_ZEROFILL)
+        return chunk->hdr.addr;
+  return 0;
+}
+
 template <typename E>
 static void fix_synthetic_symbol_values(Context<E> &ctx) {
   get_symbol(ctx, "__dyld_private")->value = ctx.data->hdr.addr;
   get_symbol(ctx, "__mh_dylib_header")->value = ctx.data->hdr.addr;
   get_symbol(ctx, "__mh_bundle_header")->value = ctx.data->hdr.addr;
+  get_symbol(ctx, "___dso_handle")->value = ctx.data->hdr.addr;
 }
 
 template <typename E>
@@ -314,6 +366,7 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
     ctx.dylibs.push_back(DylibFile<E>::create(ctx, mf));
     break;
   case FileType::MACH_OBJ:
+  case FileType::LLVM_BITCODE:
     ctx.objs.push_back(ObjectFile<E>::create(ctx, mf, ""));
     break;
   case FileType::AR:
@@ -322,8 +375,8 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
         ctx.objs.push_back(ObjectFile<E>::create(ctx, child, mf->name));
     break;
   default:
+    Fatal(ctx) << mf->name << ": unknown file type";
     break;
-    // Fatal(ctx) << mf->name << ": unknown file type";
   }
 }
 
@@ -442,13 +495,21 @@ static int do_main(int argc, char **argv) {
     Fatal(ctx) << "unknown cputype: " << ctx.arg.arch;
   }
 
+  // Handle -sectcreate
+  for (SectCreateOption arg : ctx.arg.sectcreate) {
+    MappedFile<Context<E>> *mf =
+      MappedFile<Context<E>>::must_open(ctx, std::string(arg.filename));
+    SectCreateSection<E> *sec =
+      new SectCreateSection<E>(ctx, arg.segname, arg.sectname, mf->get_contents());
+    ctx.chunk_pool.emplace_back(sec);
+  }
+
   read_input_files(ctx, file_args);
 
-  i64 priority = 1;
   for (ObjectFile<E> *file : ctx.objs)
-    file->priority = priority++;
+    file->priority = ctx.file_priority++;
   for (DylibFile<E> *dylib : ctx.dylibs)
-    dylib->priority = priority++;
+    dylib->priority = ctx.file_priority++;
 
   for (i64 i = 0; i < ctx.dylibs.size(); i++)
     ctx.dylibs[i]->dylib_idx = i + 1;
@@ -464,27 +525,7 @@ static int do_main(int argc, char **argv) {
       if (!file->archive_name.empty() && file->is_objc_object(ctx))
         file->is_alive = true;
 
-  // Resolve symbols
-  for (ObjectFile<E> *file : ctx.objs)
-    file->resolve_symbols(ctx);
-  for (DylibFile<E> *dylib : ctx.dylibs)
-    dylib->resolve_symbols(ctx);
-
-  std::vector<ObjectFile<E> *> live_objs;
-  for (ObjectFile<E> *file : ctx.objs)
-    if (file->is_alive)
-      live_objs.push_back(file);
-
-  for (i64 i = 0; i < live_objs.size(); i++) {
-    live_objs[i]->mark_live_objects(ctx, [&](ObjectFile<E> *file) {
-      live_objs.push_back(file);
-    });
-  }
-
-  for (ObjectFile<E> *file : ctx.objs)
-    file->resolve_symbols(ctx);
-  for (DylibFile<E> *dylib : ctx.dylibs)
-    dylib->resolve_symbols(ctx);
+  resolve_symbols(ctx);
 
   if (ctx.output_type == MH_EXECUTE && !get_symbol(ctx, ctx.arg.entry)->file)
     Error(ctx) << "undefined entry point symbol: " << ctx.arg.entry;
@@ -514,8 +555,9 @@ static int do_main(int argc, char **argv) {
   for (ObjectFile<E> *file : ctx.objs)
     file->check_duplicate_symbols(ctx);
 
+  bool has_pagezero_seg = ctx.arg.pagezero_size;
   for (i64 i = 0; i < ctx.segments.size(); i++)
-    ctx.segments[i]->seg_idx = i + 1;
+    ctx.segments[i]->seg_idx = (has_pagezero_seg ? i + 1 : i);
 
   for (ObjectFile<E> *file : ctx.objs)
     for (std::unique_ptr<Subsection<E> > &subsec : file->subsections)
@@ -527,11 +569,17 @@ static int do_main(int argc, char **argv) {
     std::erase_if(ctx.dylibs, [](DylibFile<E> *file) { return !file->is_needed; });
 
   export_symbols(ctx);
+
   i64 output_size = assign_offsets(ctx);
+  ctx.tls_begin = get_tls_begin(ctx);
   fix_synthetic_symbol_values(ctx);
 
-  ctx.output_file = OutputFile<E>::open(ctx, ctx.arg.output, output_size, 0777);
+  ctx.output_file =
+    OutputFile<Context<E>>::open(ctx, ctx.arg.output, output_size, 0777);
   ctx.buf = ctx.output_file->buf;
+
+  if (ctx.arg.uuid != UUID_NONE)
+    ctx.mach_hdr.write_uuid(ctx);
 
   for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
     seg->copy_buf(ctx);

@@ -1,6 +1,7 @@
 #include "mold.h"
 #include "../archive-file.h"
 #include "../cmdline.h"
+#include "../output-file.h"
 
 #include <cstring>
 #include <functional>
@@ -475,6 +476,10 @@ static int elf_main(int argc, char **argv) {
   // Set is_import and is_export bits for each symbol.
   compute_import_export(ctx);
 
+  // Read address-significant section information.
+  if (ctx.arg.icf && !ctx.arg.icf_all)
+    mark_addrsig(ctx);
+
   // Garbage-collect unreachable sections.
   if (ctx.arg.gc_sections)
     gc_sections(ctx);
@@ -668,7 +673,8 @@ static int elf_main(int argc, char **argv) {
   t_before_copy.stop();
 
   // Create an output file
-  ctx.output_file = OutputFile<E>::open(ctx, ctx.arg.output, filesize, 0777);
+  ctx.output_file =
+    OutputFile<Context<E>>::open(ctx, ctx.arg.output, filesize, 0777);
   ctx.buf = ctx.output_file->buf;
 
   Timer t_copy(ctx, "copy");

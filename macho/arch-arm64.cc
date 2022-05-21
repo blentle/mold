@@ -54,7 +54,7 @@ void StubHelperSection<ARM64>::copy_buf(Context<ARM64> &ctx) {
   buf[0] |= encode_page(page(dyld_private) - page(this->hdr.addr));
   buf[1] |= bits(dyld_private, 11, 0) << 10;
 
-  u64 stub_binder = get_symbol(ctx, "dyld_stub_binder")->get_addr(ctx);
+  u64 stub_binder = get_symbol(ctx, "dyld_stub_binder")->get_got_addr(ctx);
   buf[3] |= encode_page(page(stub_binder) - page(this->hdr.addr - 12));
   buf[4] |= bits(stub_binder, 11, 0) << 10;
 
@@ -76,14 +76,6 @@ void StubHelperSection<ARM64>::copy_buf(Context<ARM64> &ctx) {
   }
 }
 
-static i64 read_addend(u8 *buf, const MachRel &r) {
-  if (r.p2size == 2)
-    return *(il32 *)(buf + r.offset);
-  if (r.p2size == 3)
-    return *(il64 *)(buf + r.offset);
-  unreachable();
-}
-
 static Relocation<ARM64>
 read_reloc(Context<ARM64> &ctx, ObjectFile<ARM64> &file,
            const MachSection &hdr, MachRel *rels, i64 &idx) {
@@ -92,7 +84,16 @@ read_reloc(Context<ARM64> &ctx, ObjectFile<ARM64> &file,
   switch (rels[idx].type) {
   case ARM64_RELOC_UNSIGNED:
   case ARM64_RELOC_SUBTRACTOR:
-    addend = read_addend((u8 *)file.mf->data + hdr.offset, rels[idx]);
+    switch (MachRel &r = rels[idx]; r.p2size) {
+    case 2:
+      addend = *(il32 *)((u8 *)file.mf->data + hdr.offset + r.offset);
+      break;
+    case 3:
+      addend = *(il64 *)((u8 *)file.mf->data + hdr.offset + r.offset);
+      break;
+    default:
+      unreachable();
+    }
     break;
   case ARM64_RELOC_ADDEND:
     addend = rels[idx++].idx;
@@ -108,12 +109,7 @@ read_reloc(Context<ARM64> &ctx, ObjectFile<ARM64> &file,
     return rel;
   }
 
-  u32 addr;
-  if (r.is_pcrel)
-    addr = hdr.addr + r.offset + addend;
-  else
-    addr = addend;
-
+  u64 addr = r.is_pcrel ? (hdr.addr + r.offset + addend) : addend;
   Subsection<ARM64> *target = file.find_subsection(ctx, addr);
   if (!target)
     Fatal(ctx) << file << ": bad relocation: " << r.offset;
@@ -143,7 +139,20 @@ void Subsection<ARM64>::scan_relocations(Context<ARM64> &ctx) {
     if (!sym)
       continue;
 
+    if (sym->is_imported && sym->file->is_dylib)
+      ((DylibFile<ARM64> *)sym->file)->is_needed = true;
+
     switch (r.type) {
+    case ARM64_RELOC_UNSIGNED:
+      if (sym->is_imported) {
+        if (r.p2size != 3) {
+          Error(ctx) << this->isec << ": " << r << " relocation at offset 0x"
+                     << std::hex << r.offset << " against symbol `"
+                     << *sym << "' can not be used";
+        }
+        r.needs_dynrel = true;
+      }
+      break;
     case ARM64_RELOC_GOT_LOAD_PAGE21:
     case ARM64_RELOC_GOT_LOAD_PAGEOFF12:
     case ARM64_RELOC_POINTER_TO_GOT:
@@ -155,11 +164,8 @@ void Subsection<ARM64>::scan_relocations(Context<ARM64> &ctx) {
       break;
     }
 
-    if (sym->is_imported) {
+    if (sym->is_imported)
       sym->flags |= NEEDS_STUB;
-      if (sym->file->is_dylib)
-        ((DylibFile<ARM64> *)sym->file)->is_needed = true;
-    }
   }
 }
 
@@ -205,6 +211,11 @@ void Subsection<ARM64>::apply_reloc(Context<ARM64> &ctx, u8 *buf) {
     default:
       Fatal(ctx) << isec << ": unknown reloc: " << (int)r.type;
     }
+
+    // An address of a thread-local variable is computed as an offset
+    // to the beginning of the first thread-local section.
+    if (isec.hdr.type == S_THREAD_LOCAL_VARIABLES)
+      val -= ctx.tls_begin;
 
     // Write a computed value to the output buffer.
     switch (r.type) {

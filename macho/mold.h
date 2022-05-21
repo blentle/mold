@@ -1,6 +1,7 @@
 #pragma once
 
 #include "macho.h"
+#include "lto.h"
 #include "../mold.h"
 
 #include <map>
@@ -56,11 +57,18 @@ struct Relocation {
   u32 offset = 0;
   u8 type = -1;
   u8 p2size = 0;
-  bool is_pcrel = false;
+  u8 is_pcrel : 1 = false;
+  u8 needs_dynrel : 1 = false;
   i64 addend = 0;
   Symbol<E> *sym = nullptr;
   Subsection<E> *subsec = nullptr;
 };
+
+template <typename E>
+std::ostream &operator<<(std::ostream &out, const Relocation<E> &rel) {
+  out << rel_to_string<E>(rel.type);
+  return out;
+}
 
 template <typename E>
 struct UnwindRecord {
@@ -75,13 +83,14 @@ struct UnwindRecord {
   Symbol<E> *personality = nullptr;
   Subsection<E> *lsda = nullptr;
   u32 lsda_offset = 0;
-  bool is_alive = false;
 };
 
 template <typename E>
 class InputFile {
 public:
   virtual ~InputFile() = default;
+  void clear_symbols();
+  virtual void resolve_symbols(Context<E> &ctx) = 0;
 
   MappedFile<Context<E>> *mf = nullptr;
   std::vector<Symbol<E> *> syms;
@@ -105,7 +114,7 @@ public:
   void parse(Context<E> &ctx);
   Subsection<E> *find_subsection(Context<E> &ctx, u32 addr);
   void parse_compact_unwind(Context<E> &ctx, MachSection &hdr);
-  void resolve_symbols(Context<E> &ctx);
+  void resolve_symbols(Context<E> &ctx) override;
   bool is_objc_object(Context<E> &ctx);
   void mark_live_objects(Context<E> &ctx,
                          std::function<void(ObjectFile<E> *)> feeder);
@@ -121,6 +130,7 @@ public:
   std::vector<Symbol<E>> local_syms;
   std::vector<UnwindRecord<E>> unwind_records;
   std::span<DataInCodeEntry> data_in_code_entries;
+  LTOModule *lto_module = nullptr;
 
 private:
   void parse_sections(Context<E> &ctx);
@@ -130,10 +140,14 @@ private:
   LoadCommand *find_load_command(Context<E> &ctx, u32 type);
   i64 find_subsection_idx(Context<E> &ctx, u32 addr);
   InputSection<E> *get_common_sec(Context<E> &ctx);
+  void parse_lto_symbols(Context<E> &ctx);
 
   MachSection *unwind_sec = nullptr;
   std::unique_ptr<MachSection> common_hdr;
   InputSection<E> *common_sec = nullptr;
+
+  // For LTO
+  std::vector<MachSym> mach_syms2;
 };
 
 template <typename E>
@@ -142,7 +156,7 @@ public:
   static DylibFile *create(Context<E> &ctx, MappedFile<Context<E>> *mf);
 
   void parse(Context<E> &ctx);
-  void resolve_symbols(Context<E> &ctx);
+  void resolve_symbols(Context<E> &ctx) override;
 
   std::string_view install_name;
   i64 dylib_idx = 0;
@@ -253,6 +267,7 @@ struct Symbol {
 
   u8 is_extern : 1 = false;
   u8 is_common : 1 = false;
+  u8 is_weak_def : 1 = false;
   u8 is_imported : 1 = false;
   u8 referenced_dynamically : 1 = false;
 
@@ -315,6 +330,7 @@ public:
 
   void compute_size(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
+  void write_uuid(Context<E> &ctx);
 };
 
 template <typename E>
@@ -409,7 +425,7 @@ public:
   LazyBindSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__lazy_binding") {
     this->is_hidden = true;
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
   }
 
   void add(Context<E> &ctx, Symbol<E> &sym, i64 flags);
@@ -489,7 +505,7 @@ public:
   SymtabSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__symbol_table") {
     this->is_hidden = true;
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
   }
 
   void compute_size(Context<E> &ctx) override;
@@ -511,7 +527,7 @@ public:
   StrtabSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__LINKEDIT", "__string_table") {
     this->is_hidden = true;
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
   }
 
   i64 add_string(std::string_view str);
@@ -603,20 +619,6 @@ public:
 };
 
 template <typename E>
-class UnwindEncoder {
-public:
-  std::vector<u8> encode(Context<E> &ctx, std::span<UnwindRecord<E>> records);
-
-private:
-  u32 encode_personality(Context<E> &ctx, Symbol<E> *sym);
-
-  std::vector<std::span<UnwindRecord<E>>>
-  split_records(std::span<UnwindRecord<E>> records);
-
-  std::vector<Symbol<E> *> personalities;
-};
-
-template <typename E>
 class UnwindInfoSection : public Chunk<E> {
 public:
   UnwindInfoSection(Context<E> &ctx)
@@ -634,7 +636,7 @@ template <typename E>
 class GotSection : public Chunk<E> {
 public:
   GotSection(Context<E> &ctx) : Chunk<E>(ctx, "__DATA_CONST", "__got") {
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
     this->hdr.type = S_NON_LAZY_SYMBOL_POINTERS;
   }
 
@@ -649,7 +651,7 @@ class LazySymbolPtrSection : public Chunk<E> {
 public:
   LazySymbolPtrSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__DATA", "__la_symbol_ptr") {
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
     this->hdr.type = S_LAZY_SYMBOL_POINTERS;
   }
 
@@ -661,7 +663,7 @@ class ThreadPtrsSection : public Chunk<E> {
 public:
   ThreadPtrsSection(Context<E> &ctx)
     : Chunk<E>(ctx, "__DATA", "__thread_ptrs") {
-    this->hdr.p2align = std::countr_zero(8U);
+    this->hdr.p2align = 3;
     this->hdr.type = S_THREAD_LOCAL_VARIABLE_POINTERS;
   }
 
@@ -669,6 +671,20 @@ public:
   void copy_buf(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> syms;
+};
+
+template <typename E>
+class SectCreateSection : public Chunk<E> {
+public:
+  SectCreateSection(Context<E> &ctx, std::string_view seg, std::string_view sect,
+                    std::string_view contents)
+    : Chunk<E>(ctx, seg, sect), contents(contents) {
+    this->hdr.size = contents.size();
+  }
+
+  void copy_buf(Context<E> &ctx) override;
+
+  std::string_view contents;
 };
 
 //
@@ -683,30 +699,6 @@ void print_map(Context<E> &ctx);
 //
 
 void dump_file(std::string path);
-
-//
-// output-file.cc
-//
-
-template <typename E>
-class OutputFile {
-public:
-  static std::unique_ptr<OutputFile>
-  open(Context<E> &ctx, std::string path, i64 filesize, i64 perm);
-
-  virtual void close(Context<E> &ctx) = 0;
-  virtual ~OutputFile() {}
-
-  u8 *buf = nullptr;
-  std::string path;
-  i64 filesize;
-  bool is_mmapped;
-  bool is_unmapped = false;
-
-protected:
-  OutputFile(std::string path, i64 filesize, bool is_mmapped)
-    : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
-};
 
 //
 // yaml.cc
@@ -737,6 +729,10 @@ struct TextDylib {
   std::string_view parent_umbrella;
   std::vector<std::string_view> reexported_libs;
   std::vector<std::string_view> exports;
+  std::vector<std::string_view> weak_exports;
+  std::vector<std::string_view> objc_classes;
+  std::vector<std::string_view> objc_eh_types;
+  std::vector<std::string_view> objc_ivars;
 };
 
 template <typename E>
@@ -757,8 +753,26 @@ template <typename E>
 void dead_strip(Context<E> &ctx);
 
 //
+// lto.cc
+//
+
+template <typename E>
+void load_lto_plugin(Context<E> &ctx);
+
+template <typename E>
+void do_lto(Context<E> &ctx);
+
+//
 // main.cc
 //
+
+enum UuidKind { UUID_NONE, UUID_HASH, UUID_RANDOM };
+
+struct SectCreateOption {
+  std::string_view segname;
+  std::string_view sectname;
+  std::string_view filename;
+};
 
 template <typename E>
 struct Context {
@@ -790,20 +804,23 @@ struct Context {
 
   // Command-line arguments
   struct {
+    UuidKind uuid = UUID_HASH;
     bool ObjC = false;
     bool adhoc_codesign = true;
     bool color_diagnostics = false;
     bool dead_strip = false;
     bool dead_strip_dylibs = false;
     bool deduplicate = true;
-    bool demangle = false;
+    bool demangle = true;
     bool dylib = false;
     bool dynamic = true;
+    bool export_dynamic = false;
     bool fatal_warnings = false;
     bool noinhibit_exec = false;
     bool search_paths_first = true;
     bool trace = false;
     i64 arch = CPU_TYPE_ARM64;
+    i64 filler = 0;
     i64 headerpad = 256;
     i64 pagezero_size = 0;
     i64 platform = PLATFORM_MACOS;
@@ -812,34 +829,45 @@ struct Context {
     i64 stack_size = 0;
     std::string chroot;
     std::string entry = "_main";
+    std::string final_output;
     std::string install_name;
+    std::string lto_library;
     std::string map;
     std::string output = "a.out";
     std::vector<std::string> U;
     std::vector<std::string> framework_paths;
     std::vector<std::string> library_paths;
+    std::vector<std::string> mllvm;
     std::vector<std::string> rpath;
     std::vector<std::string> syslibroot;
+    std::vector<SectCreateOption> sectcreate;
   } arg;
 
   std::vector<std::string_view> cmdline_args;
   u32 output_type = MH_EXECUTE;
+  i64 file_priority = 10000;
   bool all_load = false;
   bool needed_l = false;
   bool hidden_l = false;
 
+  u8 uuid[16] = {};
   bool has_error = false;
+  u64 tls_begin = 0;
+
+  LTOPlugin lto = {};
+  std::once_flag lto_plugin_loaded;
 
   tbb::concurrent_hash_map<std::string_view, Symbol<E>, HashCmp> symbol_map;
 
-  std::unique_ptr<OutputFile<E>> output_file;
+  std::unique_ptr<OutputFile<Context<E>>> output_file;
   u8 *buf;
+  bool overwrite_output_file = false;
 
   tbb::concurrent_vector<std::unique_ptr<ObjectFile<E>>> obj_pool;
   tbb::concurrent_vector<std::unique_ptr<DylibFile<E>>> dylib_pool;
   tbb::concurrent_vector<std::unique_ptr<u8[]>> string_pool;
   tbb::concurrent_vector<std::unique_ptr<MappedFile<Context<E>>>> mf_pool;
-  std::vector<std::unique_ptr<OutputSection<E>>> osec_pool;
+  std::vector<std::unique_ptr<Chunk<E>>> chunk_pool;
 
   tbb::concurrent_vector<std::unique_ptr<TimerRecord>> timer_records;
 
@@ -928,7 +956,10 @@ inline Symbol<E> *get_symbol(Context<E> &ctx, std::string_view name) {
 
 template <typename E>
 inline std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym) {
-  out << sym.name;
+  if (opt_demangle && sym.name.starts_with("__Z"))
+    out << demangle(sym.name.substr(1));
+  else
+    out << sym.name;
   return out;
 }
 

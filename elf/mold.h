@@ -327,6 +327,7 @@ public:
   std::atomic_bool is_alive = true;
   u8 p2align = 0;
 
+  u8 address_significant : 1 = false;
   u8 compressed : 1 = false;
   u8 uncompressed : 1 = false;
   u8 killed_by_icf : 1 = false;
@@ -365,7 +366,7 @@ public:
   virtual ~Chunk() = default;
   virtual ChunkKind kind() { return SYNTHETIC; }
   virtual void copy_buf(Context<E> &ctx) {}
-  virtual void write_to(Context<E> &ctx, u8 *buf);
+  virtual void write_to(Context<E> &ctx, u8 *buf) { unreachable(); }
   virtual void update_shdr(Context<E> &ctx) {}
 
   // For --gdb-index
@@ -1059,7 +1060,7 @@ public:
   ElfShdr<E> *find_section(i64 type);
 
   virtual void resolve_symbols(Context<E> &ctx) = 0;
-  virtual void clear_symbols();
+  void clear_symbols();
 
   virtual void
   mark_live_objects(Context<E> &ctx,
@@ -1110,6 +1111,7 @@ public:
                          std::function<void(InputFile<E> *)> feeder) override;
   void convert_undefined_weak_symbols(Context<E> &ctx);
   void resolve_comdat_groups();
+  void fill_addrsig(Context<E> &ctx);
   void eliminate_duplicate_comdat_groups();
   void claim_unresolved_symbols(Context<E> &ctx);
   void scan_relocations(Context<E> &ctx);
@@ -1150,6 +1152,9 @@ public:
   std::vector<std::vector<i32>> r_deltas;
   std::vector<std::vector<ElfRel<E>>> sorted_rels;
   std::vector<std::vector<Symbol<E> *>> sorted_symbols;
+
+  // For ICF
+  InputSection<E> *llvm_addrsig = nullptr;
 
   // For .gdb_index
   InputSection<E> *debug_info = nullptr;
@@ -1385,6 +1390,7 @@ template <typename E> void create_reloc_sections(Context<E> &);
 template <typename E> void apply_version_script(Context<E> &);
 template <typename E> void parse_symbol_version(Context<E> &);
 template <typename E> void compute_import_export(Context<E> &);
+template <typename E> void mark_addrsig(Context<E> &);
 template <typename E> void clear_padding(Context<E> &);
 template <typename E> i64 get_section_rank(Context<E> &, Chunk<E> *chunk);
 template <typename E> i64 set_osec_offsets(Context<E> &);
@@ -1440,30 +1446,6 @@ i64 create_range_extension_thunks(Context<ARM64> &ctx);
 //
 
 i64 riscv_resize_sections(Context<RISCV64> &ctx);
-
-//
-// output-file.cc
-//
-
-template <typename E>
-class OutputFile {
-public:
-  static std::unique_ptr<OutputFile<E>>
-  open(Context<E> &ctx, std::string path, i64 filesize, i64 perm);
-
-  virtual void close(Context<E> &ctx) = 0;
-  virtual ~OutputFile() = default;
-
-  u8 *buf = nullptr;
-  std::string path;
-  i64 filesize;
-  bool is_mmapped;
-  bool is_unmapped = false;
-
-protected:
-  OutputFile(std::string path, i64 filesize, bool is_mmapped)
-    : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
-};
 
 //
 // main.cc
@@ -1577,6 +1559,8 @@ struct Context {
     bool hash_style_gnu = false;
     bool hash_style_sysv = true;
     bool icf = false;
+    bool icf_all = false;
+    bool ignore_data_address_equality = false;
     bool is_static = false;
     bool lto_pass2 = false;
     bool noinhibit_exec = false;
@@ -1593,6 +1577,7 @@ struct Context {
     bool relax = true;
     bool relocatable = false;
     bool repro = false;
+    bool rosegment = true;
     bool shared = false;
     bool stats = false;
     bool strip_all = false;
@@ -1704,8 +1689,9 @@ struct Context {
   ObjectFile<E> *internal_obj = nullptr;
 
   // Output buffer
-  std::unique_ptr<OutputFile<E>> output_file;
+  std::unique_ptr<OutputFile<Context<E>>> output_file;
   u8 *buf = nullptr;
+  bool overwrite_output_file = true;
 
   std::vector<Chunk<E> *> chunks;
   std::atomic_bool needs_tlsld = false;

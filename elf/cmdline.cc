@@ -87,8 +87,10 @@ Options:
   --gdb-index                 Create .gdb_index for faster gdb startup
   --hash-style [sysv,gnu,both]
                               Set hash style
-  --icf=[all,none]            Fold identical code
+  --icf=[all,safe,none]       Fold identical code
     --no-icf
+  --ignore-data-address-equality
+                              Allow merging non-executable sections with --icf
   --image-base ADDR           Set the base address to a given value
   --init SYMBOL               Call SYMBOl at load-time
   --no-undefined              Report undefined symbols (even with --shared)
@@ -113,6 +115,8 @@ Options:
   --require-defined SYMBOL    Require SYMBOL be defined in the final output
   --retain-symbols-file FILE  Keep only symbols listed in FILE
   --reverse-sections          Reverses input sections in the output file
+  --rosegment                 Put read-only non-executable sections in their own segment (default)
+    --no-rosegment            Put read-only non-executable sections in an executable segment
   --rpath DIR                 Add DIR to runtime search path
   --rpath-link DIR            Ignored
   --run COMMAND ARG...        Run COMMAND with mold as /usr/bin/ld
@@ -537,6 +541,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.shuffle_sections_seed = parse_number(ctx, "shuffle-sections", arg);
     } else if (read_flag("reverse-sections")) {
       ctx.arg.shuffle_sections = SHUFFLE_SECTIONS_REVERSE;
+    } else if (read_flag("rosegment")) {
+      ctx.arg.rosegment = true;
+    } else if (read_flag("no-rosegment")) {
+      ctx.arg.rosegment = false;
     } else if (read_arg("y") || read_arg("trace-symbol")) {
       ctx.arg.trace_symbol.push_back(arg);
     } else if (read_arg("filler")) {
@@ -761,14 +769,20 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("no-print-gc-sections")) {
       ctx.arg.print_gc_sections = false;
     } else if (read_arg("icf")) {
-      if (arg == "all")
+      if (arg == "all") {
         ctx.arg.icf = true;
-      else if (arg == "none")
+        ctx.arg.icf_all = true;
+      } else if (arg == "safe") {
+        ctx.arg.icf = true;
+      } else if (arg == "none") {
         ctx.arg.icf = false;
-      else
+      } else {
         Fatal(ctx) << "unknown --icf argument: " << arg;
+      }
     } else if (read_flag("no-icf")) {
       ctx.arg.icf = false;
+    } else if (read_flag("ignore-data-address-equality")) {
+      ctx.arg.ignore_data_address_equality = true;
     } else if (read_arg("image-base")) {
       ctx.arg.image_base = parse_number(ctx, "image-base", arg);
     } else if (read_flag("print-icf-sections")) {
@@ -947,6 +961,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_z_flag("combreloc")) {
     } else if (read_z_flag("nocombreloc")) {
     } else if (read_z_arg("common-page-size")) {
+    } else if (read_flag("no-keep-memory")) {
     } else if (read_arg("version-script")) {
       remaining.push_back("--version-script=" + std::string(arg));
     } else if (read_arg("dynamic-list")) {
@@ -1045,6 +1060,19 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   // statically-linked executable doesn't contain a tranpoline
   // function needed for TLSDESC.
   ctx.relax_tlsdesc = ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared);
+
+  // By default, mold tries to ovewrite to an output file if exists
+  // because at least on Linux, writing to an existing file is much
+  // faster than creating a fresh file and writing to it.
+  //
+  // However, if an existing file is in use, writing to it will mess
+  // up processes that are executing that file. Linux prevents a write
+  // to a running executable file; it returns ETXTBSY on open(2).
+  // However, that mechanism doesn't protect .so files. Therefore, we
+  // want to disable this optimization if we are creating a shared
+  // object file.
+  if (ctx.arg.shared)
+    ctx.overwrite_output_file = false;
 
   if (version_shown && remaining.empty())
     exit(0);
