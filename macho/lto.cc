@@ -2,6 +2,7 @@
 #include "mold.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <dlfcn.h>
 
 namespace mold::macho {
@@ -108,16 +109,27 @@ void do_lto(Context<E> &ctx) {
     for (ObjectFile<E> *file : ctx.objs)
       if (file->lto_module)
         for (Symbol<E> *sym : file->syms)
-          if (sym->file == file && sym->is_extern)
+          if (sym->file == file && sym->scope != SCOPE_LOCAL)
             ctx.lto.codegen_add_must_preserve_symbol(cg, sym->name.data());
   }
 
-  if (Symbol<E> *sym = get_symbol(ctx, ctx.arg.entry); sym->file)
-    ctx.lto.codegen_add_must_preserve_symbol(cg, sym->name.data());
+  if (ctx.arg.entry->file)
+    ctx.lto.codegen_add_must_preserve_symbol(cg, ctx.arg.entry->name.data());
 
   // Run the compiler backend to do LTO.
   size_t size;
   u8 *data = (u8 *)ctx.lto.codegen_compile(cg, &size);
+  if (!data)
+    Fatal(ctx) << "lto_codegen_compile failed: " << ctx.lto.get_error_message();
+
+  if (!ctx.arg.object_path_lto.empty()) {
+    FILE *out = fopen(ctx.arg.object_path_lto.c_str(), "w");
+    if (!out)
+      Fatal(ctx) << "-object_path_lto: cannot open " << ctx.arg.object_path_lto
+                 << ": " << errno_string();
+    fwrite(data, size, 1, out);
+    fclose(out);
+  }
 
   // Remove bitcode object files from ctx.objs.
   for (ObjectFile<E> *file : ctx.objs) {
@@ -126,6 +138,8 @@ void do_lto(Context<E> &ctx) {
       file->is_alive = false;
     }
   }
+
+  std::erase_if(ctx.objs, [](InputFile<E> *file) { return !file->is_alive; });
 
   // Add a result of LTO as a new object file.
   MappedFile<Context<E>> *mf = new MappedFile<Context<E>>;

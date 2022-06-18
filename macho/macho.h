@@ -242,7 +242,7 @@ static constexpr u32 DICE_KIND_JUMP_TABLE32 = 4;
 static constexpr u32 DICE_KIND_ABS_JUMP_TABLE32 = 5;
 
 static constexpr u32 N_UNDF = 0;
-static constexpr u32 N_ABS = 2;
+static constexpr u32 N_ABS = 1;
 static constexpr u32 N_INDR = 5;
 static constexpr u32 N_PBUD = 6;
 static constexpr u32 N_SECT = 7;
@@ -582,6 +582,12 @@ struct DataInCodeEntry {
   ul16 kind;
 };
 
+struct LinkerOptionCommand {
+  ul32 cmd;
+  ul32 cmdsize;
+  ul32 count;
+};
+
 // This struct is named `n_list` on BSD and macOS.
 struct MachSym {
   bool is_undef() const {
@@ -589,13 +595,13 @@ struct MachSym {
   }
 
   bool is_common() const {
-    return type == N_UNDF && ext && value;
+    return type == N_UNDF && is_extern && value;
   }
 
   ul32 stroff;
-  u8 ext : 1;
+  u8 is_extern : 1;
   u8 type : 3;
-  u8 pext : 1;
+  u8 is_private_extern : 1;
   u8 stub : 3;
   u8 sect;
   union {

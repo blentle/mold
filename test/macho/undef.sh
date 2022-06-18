@@ -13,24 +13,23 @@ cd "$(dirname "$0")"/../..
 t=out/test/macho/$testname
 mkdir -p $t
 
-cat <<EOF | $CC -shared -o $t/a.dylib -xc -
-_Thread_local int b;
-_Thread_local int c = 5;
+cat <<EOF | $CC -o $t/a.o -c -xc -
+void foo() {}
 EOF
 
-cat <<EOF | $CC -o $t/b.o -c -xc -
-#include <stdio.h>
+rm -f $t/b.a
+ar rcs $t/b.a $t/a.o
 
-int a = 3;
-extern _Thread_local int b;
-extern _Thread_local int c;
-
-int main() {
-  printf("%d %d %d\n", a, b, c);
-}
+cat <<EOF | $CC -o $t/c.o -c -xc -
+int main() {}
 EOF
 
-clang --ld-path=./ld64 -o $t/exe $t/a.dylib $t/b.o
-$t/exe | grep -q '^3 0 5$'
+clang --ld-path=./ld64 -o $t/exe1 $t/b.a $t/c.o
+nm $t/exe1 > $t/log1
+! grep -q _foo $t/log1 || false
+
+clang --ld-path=./ld64 -o $t/exe2 $t/b.a $t/c.o -Wl,-u,_foo
+nm $t/exe2 > $t/log2
+grep -q _foo $t/log2
 
 echo OK

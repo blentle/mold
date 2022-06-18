@@ -10,19 +10,17 @@ MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
+t=out/test/macho/$testname
 mkdir -p $t
 
-cat <<EOF | $CC -o $t/a.so -shared -fPIC -xc -
+cat <<EOF | $CC -o $t/a.o -c -xc -
 void foo() {}
+__attribute__((visibility("hidden"))) void bar() {}
 EOF
 
-cat <<EOF | $CC -o $t/b.o -fPIC -c -xc -
-__attribute__((visibility("hidden"))) void foo();
-int main() { foo(); }
-EOF
-
-! $CC -B. -o $t/exe $t/a.so $t/b.o >& $t/log
-grep -q 'undefined symbol: foo' $t/log
+clang --ld-path=./ld64 -shared -o $t/b.dylib $t/a.o
+objdump --macho --exports-trie $t/b.dylib > $t/log
+grep -q _foo $t/log
+! grep -q _bar $t/log || false
 
 echo OK

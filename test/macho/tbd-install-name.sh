@@ -13,9 +13,7 @@ cd "$(dirname "$0")"/../..
 t=out/test/macho/$testname
 mkdir -p $t
 
-mkdir -p $t/libs/SomeFramework.framework/
-
-cat > $t/libs/SomeFramework.framework/SomeFramework.tbd <<EOF
+cat > $t/libfoo.tbd <<'EOF'
 --- !tapi-tbd
 tbd-version:     4
 targets:         [ x86_64-macos, arm64-macos ]
@@ -24,32 +22,28 @@ uuids:
     value:           00000000-0000-0000-0000-000000000000
   - target:          arm64-macos
     value:           00000000-0000-0000-0000-000000000000
-install-name:    '/usr/frameworks/SomeFramework.framework/SomeFramework'
-current-version: 0000
-compatibility-version: 150
-reexported-libraries:
-  - targets:         [ x86_64-macos, arm64-macos ]
-    libraries:       [ ]
+install-name:    '/foo'
+current-version: 0
+compatibility-version: 0
 exports:
   - targets:         [ x86_64-macos, arm64-macos ]
-    symbols:         [ _foo ]
-    weak-symbols:    [ _bar ]
+    symbols:         [ '$ld$install_name$os25.0$/bar', _foo ]
 ...
 EOF
 
 cat <<EOF | clang -o $t/a.o -c -xc -
-extern void foo();
-extern void bar() __attribute__((weak_import));
-
-int main() {
-  foo();
-  if (bar)
-    bar();
-}
+void foo();
+int main() { foo(); }
 EOF
 
-clang --ld-path=./ld64 -o $t/exe $t/a.o -F$t/libs/ -Wl,-framework,SomeFramework
+clang --ld-path=./ld64 -o $t/exe1 $t/libfoo.tbd $t/a.o \
+  -Wl,-platform_version,macos,20.0,20.0 >& /dev/null
 
-otool -L $t/exe | grep -q '/usr/frameworks/SomeFramework.framework/SomeFramework'
+otool -L $t/exe1 | grep -q /foo
+
+clang --ld-path=./ld64 -o $t/exe2 $t/libfoo.tbd $t/a.o \
+  -Wl,-platform_version,macos,25.0,21.0 >& /dev/null
+
+otool -L $t/exe2 | grep -q /bar
 
 echo OK

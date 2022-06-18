@@ -1,4 +1,5 @@
 #include "mold.h"
+#include "../cmdline.h"
 
 #include <sstream>
 #include <sys/stat.h>
@@ -98,6 +99,7 @@ Options:
   --oformat=binary            Omit ELF, section and program headers
   --pack-dyn-relocs=[relr,none]
                               Pack dynamic relocations
+  --package-metadata=STRING   Set a given string to .note.package
   --perf                      Print performance statistics
   --pie, --pic-executable     Create a position independent executable
     --no-pie, --no-pic-executable
@@ -267,18 +269,6 @@ split_by_comma_or_colon(std::string_view str) {
   return vec;
 }
 
-static std::string_view trim(std::string_view str) {
-  size_t pos = str.find_first_not_of(" \t");
-  if (pos == str.npos)
-    return "";
-  str = str.substr(pos);
-
-  pos = str.find_last_not_of(" \t");
-  if (pos == str.npos)
-    return str;
-  return str.substr(0, pos + 1);
-}
-
 template <typename E>
 static void read_retain_symbols_file(Context<E> &ctx, std::string_view path) {
   MappedFile<Context<E>> *mf =
@@ -299,7 +289,7 @@ static void read_retain_symbols_file(Context<E> &ctx, std::string_view path) {
       data = data.substr(pos + 1);
     }
 
-    name = trim(name);
+    name = string_trim(name);
     if (!name.empty())
       ctx.arg.retain_symbols_file->insert(name);
   }
@@ -343,7 +333,7 @@ static std::pair<i64, i64> get_plt_size(Context<E> &ctx) {
   if constexpr (std::is_same_v<E, ARM64>)
     return {32, 16};
   if constexpr (std::is_same_v<E, ARM32>)
-    return {20, 16};
+    return {32, 16};
   if constexpr (std::is_same_v<E, RISCV64>)
     return {32, 16};
   unreachable();
@@ -554,7 +544,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_arg("sysroot")) {
       ctx.arg.sysroot = arg;
     } else if (read_arg("unique")) {
-      std::optional<GlobPattern> pat = GlobPattern::compile(arg);
+      std::optional<Glob> pat = Glob::compile(arg);
       if (!pat)
         Fatal(ctx) << "-unique: invalid glob pattern: " << arg;
       ctx.arg.unique = std::move(*pat);
@@ -619,6 +609,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.pack_dyn_relocs_relr = true;
     } else if (read_flag("pack-dyn-relocs=none")) {
       ctx.arg.pack_dyn_relocs_relr = false;
+    } else if (read_arg("package-metadata")) {
+      ctx.arg.package_metadata = arg;
     } else if (read_flag("stats")) {
       ctx.arg.stats = true;
       Counter::enabled = true;
@@ -1029,6 +1021,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     if (!ctx.arg.auxiliary.empty())
       Fatal(ctx) << "-auxiliary may not be used without -shared";
   }
+
+  if (ctx.arg.thread_count == 0)
+    ctx.arg.thread_count = get_default_thread_count();
 
   if (ctx.arg.image_base % ctx.page_size)
     Fatal(ctx) << "-image-base must be a multiple of -max-page-size";
