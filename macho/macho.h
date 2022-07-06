@@ -20,8 +20,8 @@ typedef int16_t i16;
 typedef int32_t i32;
 typedef int64_t i64;
 
-class ARM64;
-class X86_64;
+struct ARM64;
+struct X86_64;
 
 template <typename E>
 std::string rel_to_string(u8 r_type);
@@ -200,10 +200,10 @@ static constexpr u32 BIND_TYPE_POINTER = 1;
 static constexpr u32 BIND_TYPE_TEXT_ABSOLUTE32 = 2;
 static constexpr u32 BIND_TYPE_TEXT_PCREL32 = 3;
 
-static constexpr u32 BIND_SPECIAL_DYLIB_SELF = 0;
-static constexpr u32 BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE = -1;
-static constexpr u32 BIND_SPECIAL_DYLIB_FLAT_LOOKUP = -2;
-static constexpr u32 BIND_SPECIAL_DYLIB_WEAK_LOOKUP = -3;
+static constexpr i32 BIND_SPECIAL_DYLIB_SELF = 0;
+static constexpr i32 BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE = -1;
+static constexpr i32 BIND_SPECIAL_DYLIB_FLAT_LOOKUP = -2;
+static constexpr i32 BIND_SPECIAL_DYLIB_WEAK_LOOKUP = -3;
 
 static constexpr u32 BIND_SYMBOL_FLAGS_WEAK_IMPORT = 0x1;
 static constexpr u32 BIND_SYMBOL_FLAGS_NON_WEAK_DEFINITION = 0x8;
@@ -317,6 +317,7 @@ static constexpr u32 PLATFORM_DRIVERKIT = 10;
 static constexpr u32 TOOL_CLANG = 1;
 static constexpr u32 TOOL_SWIFT = 2;
 static constexpr u32 TOOL_LD = 3;
+static constexpr u32 TOOL_MOLD = 0x6d6f6c64; // Hex in "mold"
 
 static constexpr u32 ARM64_RELOC_UNSIGNED = 0;
 static constexpr u32 ARM64_RELOC_SUBTRACTOR = 1;
@@ -599,11 +600,19 @@ struct MachSym {
   }
 
   ul32 stroff;
-  u8 is_extern : 1;
-  u8 type : 3;
-  u8 is_private_extern : 1;
-  u8 stub : 3;
+
+  union {
+    u8 n_type;
+    struct {
+      u8 is_extern : 1;
+      u8 type : 3;
+      u8 is_private_extern : 1;
+      u8 stub : 3;
+    };
+  };
+
   u8 sect;
+
   union {
     ul16 desc;
     struct {
@@ -611,6 +620,7 @@ struct MachSym {
       u8 p2align : 4;
     };
   };
+
   ul64 value;
 };
 

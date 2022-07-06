@@ -11,7 +11,8 @@ static u64 page(u64 val) {
   return val & 0xffff'ffff'ffff'f000;
 }
 
-static u64 encode_page(u64 val) {
+static u64 page_offset(u64 hi, u64 lo) {
+  u64 val = page(hi) - page(lo);
   return (bits(val, 13, 12) << 29) | (bits(val, 32, 14) << 5);
 }
 
@@ -32,7 +33,7 @@ void StubsSection<E>::copy_buf(Context<E> &ctx) {
     u64 this_addr = this->hdr.addr + E::stub_size * i;
 
     memcpy(buf, insn, sizeof(insn));
-    buf[0] |= encode_page(page(la_addr) - page(this_addr));
+    buf[0] |= page_offset(la_addr, this_addr);
     buf[1] |= bits(la_addr, 11, 3) << 10;
     buf += 3;
   }
@@ -56,11 +57,11 @@ void StubHelperSection<E>::copy_buf(Context<E> &ctx) {
   memcpy(buf, insn0, sizeof(insn0));
 
   u64 dyld_private = get_symbol(ctx, "__dyld_private")->get_addr(ctx);
-  buf[0] |= encode_page(page(dyld_private) - page(this->hdr.addr));
+  buf[0] |= page_offset(dyld_private, this->hdr.addr);
   buf[1] |= bits(dyld_private, 11, 0) << 10;
 
   u64 stub_binder = get_symbol(ctx, "dyld_stub_binder")->get_got_addr(ctx);
-  buf[3] |= encode_page(page(stub_binder) - page(this->hdr.addr - 12));
+  buf[3] |= page_offset(stub_binder, this->hdr.addr - 12);
   buf[4] |= bits(stub_binder, 11, 0) << 10;
 
   buf += 6;
@@ -81,49 +82,6 @@ void StubHelperSection<E>::copy_buf(Context<E> &ctx) {
   }
 }
 
-static Relocation<E>
-read_reloc(Context<E> &ctx, ObjectFile<E> &file,
-           const MachSection &hdr, MachRel *rels, i64 &idx) {
-  i64 addend = 0;
-
-  switch (rels[idx].type) {
-  case ARM64_RELOC_UNSIGNED:
-  case ARM64_RELOC_SUBTRACTOR:
-    switch (MachRel &r = rels[idx]; r.p2size) {
-    case 2:
-      addend = *(il32 *)((u8 *)file.mf->data + hdr.offset + r.offset);
-      break;
-    case 3:
-      addend = *(il64 *)((u8 *)file.mf->data + hdr.offset + r.offset);
-      break;
-    default:
-      unreachable();
-    }
-    break;
-  case ARM64_RELOC_ADDEND:
-    addend = rels[idx++].idx;
-    break;
-  }
-
-  MachRel &r = rels[idx];
-  Relocation<E> rel{r.offset, (u8)r.type, (u8)r.p2size, (bool)r.is_pcrel};
-
-  if (r.is_extern) {
-    rel.sym = file.syms[r.idx];
-    rel.addend = addend;
-    return rel;
-  }
-
-  u64 addr = r.is_pcrel ? (hdr.addr + r.offset + addend) : addend;
-  Subsection<E> *target = file.find_subsection(ctx, addr);
-  if (!target)
-    Fatal(ctx) << file << ": bad relocation: " << r.offset;
-
-  rel.subsec = target;
-  rel.addend = addr - target->input_addr;
-  return rel;
-}
-
 template <>
 std::vector<Relocation<E>>
 read_relocations(Context<E> &ctx, ObjectFile<E> &file,
@@ -132,8 +90,56 @@ read_relocations(Context<E> &ctx, ObjectFile<E> &file,
   vec.reserve(hdr.nreloc);
 
   MachRel *rels = (MachRel *)(file.mf->data + hdr.reloff);
-  for (i64 i = 0; i < hdr.nreloc; i++)
-    vec.push_back(read_reloc(ctx, file, hdr, rels, i));
+
+  for (i64 i = 0; i < hdr.nreloc; i++) {
+    i64 addend = 0;
+
+    switch (rels[i].type) {
+    case ARM64_RELOC_UNSIGNED:
+    case ARM64_RELOC_SUBTRACTOR:
+      switch (MachRel &r = rels[i]; r.p2size) {
+      case 2:
+        addend = *(il32 *)((u8 *)file.mf->data + hdr.offset + r.offset);
+        break;
+      case 3:
+        addend = *(il64 *)((u8 *)file.mf->data + hdr.offset + r.offset);
+        break;
+      default:
+        unreachable();
+      }
+      break;
+    case ARM64_RELOC_ADDEND:
+      addend = rels[i++].idx;
+      break;
+    }
+
+    MachRel &r = rels[i];
+    vec.push_back({r.offset, (u8)r.type, (u8)r.p2size});
+
+    Relocation<E> &rel = vec.back();
+
+    if (rels[i].type == ARM64_RELOC_SUBTRACTOR ||
+        (i > 0 && rels[i - 1].type == ARM64_RELOC_SUBTRACTOR)) {
+      rel.is_pcrel = false;
+    } else {
+      rel.is_pcrel = r.is_pcrel;
+    }
+
+    if (r.is_extern) {
+      rel.sym = file.syms[r.idx];
+      rel.addend = addend;
+      continue;
+    }
+
+    u64 addr = r.is_pcrel ? (hdr.addr + r.offset + addend) : addend;
+    Subsection<E> *target = file.find_subsection(ctx, addr);
+    if (!target)
+      Fatal(ctx) << file << ": bad relocation: " << r.offset;
+
+    rel.subsec = target;
+    rel.addend = addr - target->input_addr;
+  }
+
   return vec;
 }
 
@@ -257,7 +263,7 @@ void Subsection<E>::apply_reloc(Context<E> &ctx, u8 *buf) {
     case ARM64_RELOC_GOT_LOAD_PAGE21:
     case ARM64_RELOC_TLVP_LOAD_PAGE21:
       assert(r.is_pcrel);
-      *(ul32 *)loc |= encode_page(page(val) - page(pc));
+      *(ul32 *)loc |= page_offset(val, pc);
       break;
     case ARM64_RELOC_PAGEOFF12:
     case ARM64_RELOC_GOT_LOAD_PAGEOFF12:
@@ -303,10 +309,9 @@ static bool is_reachable(Context<E> &ctx, Symbol<E> &sym,
 
   // Compute a distance between the relocated place and the symbol
   // and check if they are within reach.
-  i64 S = sym.get_addr(ctx);
-  i64 A = rel.addend;
-  i64 P = subsec.get_addr(ctx) + rel.offset;
-  i64 val = S + A - P;
+  i64 addr = sym.get_addr(ctx);
+  i64 pc = subsec.get_addr(ctx) + rel.offset;
+  i64 val = addr + rel.addend - pc;
   return -(1 << 27) <= val && val < (1 << 27);
 }
 
@@ -453,13 +458,13 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   static_assert(ENTRY_SIZE == sizeof(data));
 
   for (i64 i = 0; i < symbols.size(); i++) {
-    u64 S = symbols[i]->get_addr(ctx);
-    u64 P = output_section.hdr.addr + offset + i * ENTRY_SIZE;
+    u64 addr = symbols[i]->get_addr(ctx);
+    u64 pc = output_section.hdr.addr + offset + i * ENTRY_SIZE;
 
     u8 *loc = buf + i * ENTRY_SIZE;
     memcpy(loc , data, sizeof(data));
-    *(ul32 *)loc |= encode_page(page(S) - page(P));
-    *(ul32 *)(loc + 4) |= bits(S, 11, 0) << 10;
+    *(ul32 *)loc |= page_offset(addr, pc);
+    *(ul32 *)(loc + 4) |= bits(addr, 11, 0) << 10;
   }
 }
 

@@ -1,11 +1,11 @@
 #include "mold.h"
 #include "../archive-file.h"
-#include "../cmdline.h"
 #include "../output-file.h"
 #include "../sha.h"
 
 #include <cstdlib>
 #include <fcntl.h>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sys/mman.h>
@@ -255,12 +255,15 @@ template <typename E>
 static void claim_unresolved_symbols(Context<E> &ctx) {
   Timer t(ctx, "claim_unresolved_symbols");
 
-  for (std::string_view name : ctx.arg.U)
-    if (Symbol<E> *sym = get_symbol(ctx, name); !sym->file)
+  for (std::string_view name : ctx.arg.U) {
+    Symbol<E> *sym = get_symbol(ctx, name);
+    if (!sym->file) {
       sym->is_imported = true;
+      sym->is_weak = true;
+    }
+  }
 
-
-  for (ObjectFile<E> *file : ctx.objs) {
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (i64 i = 0; i < file->mach_syms.size(); i++) {
       MachSym &msym = file->mach_syms[i];
       if (!msym.is_extern || !msym.is_undef())
@@ -281,7 +284,7 @@ static void claim_unresolved_symbols(Context<E> &ctx) {
         }
       }
     }
-  }
+  });
 }
 
 template <typename E>
@@ -346,8 +349,6 @@ static void merge_cstring_sections(Context<E> &ctx) {
 
   // Decide who will become the owner for each subsection.
   tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    ObjectFile<E> *file = ctx.objs[i];
-
     for (i64 j = 0; j < vec[i].size(); j++) {
       SubsecRef &ref = vec[i][j];
       if (ref.ent->owner != &ref.subsec) {
@@ -386,10 +387,26 @@ static void merge_cstring_sections(Context<E> &ctx) {
 }
 
 template <typename E>
+static Chunk<E> *find_section(Context<E> &ctx, std::string_view segname,
+                              std::string_view sectname) {
+  for (Chunk<E> *chunk : ctx.chunks)
+    if (chunk->hdr.match(segname, sectname))
+      return chunk;
+  return nullptr;
+}
+
+template <typename E>
 static void create_synthetic_chunks(Context<E> &ctx) {
   Timer t(ctx, "create_synthetic_chunks");
 
-  // First, we add subsections specified by -order_file to output sections.
+  // Handle -sectcreate
+  for (SectCreateOption arg : ctx.arg.sectcreate) {
+    MappedFile<Context<E>> *mf =
+      MappedFile<Context<E>>::must_open(ctx, std::string(arg.filename));
+    new SectCreateSection<E>(ctx, arg.segname, arg.sectname, mf->get_contents());
+  }
+
+  // We add subsections specified by -order_file to output sections.
   for (std::string_view name : ctx.arg.order_file)
     if (Symbol<E> *sym = get_symbol(ctx, name); sym->file)
       if (Subsection<E> *subsec = sym->subsec)
@@ -411,6 +428,15 @@ static void create_synthetic_chunks(Context<E> &ctx) {
     OutputSegment<E> *seg =
       OutputSegment<E>::get_instance(ctx, chunk->hdr.get_segname());
     seg->chunks.push_back(chunk);
+  }
+
+  // Handle -add_empty_section
+  for (AddEmptySectionOption &opt : ctx.arg.add_empty_section) {
+    if (!find_section(ctx, opt.segname, opt.sectname)) {
+      OutputSegment<E> *seg = OutputSegment<E>::get_instance(ctx, opt.segname);
+      Chunk<E> *sec = new SectCreateSection<E>(ctx, opt.segname, opt.sectname, {});
+      seg->chunks.push_back(sec);
+    }
   }
 
   // Sort segments and output sections.
@@ -511,9 +537,13 @@ static void copy_sections_to_output_file(Context<E> &ctx) {
                          [&](std::unique_ptr<OutputSegment<E>> &seg) {
     Timer t2(ctx, std::string(seg->cmd.get_segname()), &t);
 
-    // Fill text segment paddings with NOPs
-    if (seg->cmd.get_segname() == "__TEXT")
-      memset(ctx.buf + seg->cmd.fileoff, 0x90, seg->cmd.filesize);
+    // Fill text segment paddings with single-byte NOP instructions so
+    // that otool wouldn't out-of-sync when disassembling an output file.
+    // Do this only for x86-64 because ARM64 instructions are always 4
+    // bytes long.
+    if constexpr (std::is_same_v<E, X86_64>)
+      if (seg->cmd.get_segname() == "__TEXT")
+        memset(ctx.buf + seg->cmd.fileoff, 0x90, seg->cmd.filesize);
 
     tbb::parallel_for_each(seg->chunks, [&](Chunk<E> *sec) {
       if (sec->hdr.type != S_ZEROFILL) {
@@ -528,8 +558,20 @@ template <typename E>
 static void compute_uuid(Context<E> &ctx) {
   Timer t(ctx, "copy_sections_to_output_file");
 
+  // Compute a markle tree of height two.
+  i64 filesize = ctx.output_file->filesize;
+  i64 shard_size = 4096 * 1024;
+  i64 num_shards = align_to(filesize, shard_size) / shard_size;
+  std::vector<u8> shards(num_shards * SHA256_SIZE);
+
+  tbb::parallel_for((i64)0, num_shards, [&](i64 i) {
+    u8 *begin = ctx.buf + shard_size * i;
+    u8 *end = (i == num_shards - 1) ? ctx.buf + filesize : begin + shard_size;
+    SHA256(begin, end - begin, shards.data() + i * SHA256_SIZE);
+  });
+
   u8 buf[SHA256_SIZE];
-  SHA256(ctx.buf, ctx.output_file->filesize, buf);
+  SHA256(shards.data(), shards.size(), buf);
   memcpy(ctx.uuid, buf, 16);
   ctx.mach_hdr.copy_buf(ctx);
 }
@@ -563,6 +605,7 @@ MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string name) {
         std::string path = dir + "/lib" + name + e;
         if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path))
           return mf;
+        ctx.missing_files.insert(path);
       }
     }
     return nullptr;
@@ -723,6 +766,9 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     } else if (opt == "-weak-l") {
       ctx.weak_l = true;
       read_file(ctx, must_find_library(arg));
+    } else if (opt == "-reexport-l") {
+      ctx.reexport_l = true;
+      read_file(ctx, must_find_library(arg));
     } else {
       unreachable();
     }
@@ -730,11 +776,13 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     ctx.needed_l = false;
     ctx.hidden_l = false;
     ctx.weak_l = false;
+    ctx.reexport_l = false;
   }
 
   // An object file can contain linker directives to load other object
   // files or libraries, so process them if any.
-  for (ObjectFile<E> *file : ctx.objs) {
+  for (i64 i = 0; i < ctx.objs.size(); i++) {
+    ObjectFile<E> *file = ctx.objs[i];
     std::vector<std::string> opts = file->get_linker_options(ctx);
 
     for (i64 j = 0; j < opts.size();) {
@@ -769,6 +817,36 @@ static void parse_object_files(Context<E> &ctx) {
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     file->parse(ctx);
   });
+}
+
+template <typename E>
+static void write_dependency_info(Context<E> &ctx) {
+  static constexpr u8 LINKER_VERSION = 0;
+  static constexpr u8 INPUT_FILE = 0x10;
+  static constexpr u8 NOT_FOUND_FILE = 0x11;
+  static constexpr u8 OUTPUT_FILE = 0x40;
+
+  std::ofstream out;
+  out.open(std::string(ctx.arg.dependency_info).c_str());
+  if (!out.is_open())
+    Fatal(ctx) << "cannot open " << ctx.arg.dependency_info
+               << ": " << errno_string();
+
+  out << LINKER_VERSION << mold_version << '\0';
+
+  std::set<std::string_view> input_files;
+  for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool)
+    if (!mf->parent)
+      input_files.insert(mf->name);
+
+  for (std::string_view s : input_files)
+    out << INPUT_FILE << s << '\0';
+
+  for (std::string_view s : ctx.missing_files)
+    out << NOT_FOUND_FILE << s << '\0';
+
+  out << OUTPUT_FILE << ctx.arg.output << '\0';
+  out.close();
 }
 
 template <typename E>
@@ -812,14 +890,8 @@ static int do_main(int argc, char **argv) {
 
   Timer t(ctx, "all");
 
-  // Handle -sectcreate
-  for (SectCreateOption arg : ctx.arg.sectcreate) {
-    MappedFile<Context<E>> *mf =
-      MappedFile<Context<E>>::must_open(ctx, std::string(arg.filename));
-    SectCreateSection<E> *sec =
-      new SectCreateSection<E>(ctx, arg.segname, arg.sectname, mf->get_contents());
-    ctx.chunk_pool.emplace_back(sec);
-  }
+  tbb::global_control tbb_cont(tbb::global_control::max_allowed_parallelism,
+                               ctx.arg.thread_count);
 
   if (ctx.arg.adhoc_codesign)
     ctx.code_sig.reset(new CodeSignatureSection<E>(ctx));
@@ -868,6 +940,10 @@ static int do_main(int argc, char **argv) {
   for (ObjectFile<E> *file : ctx.objs)
     file->check_duplicate_symbols(ctx);
 
+  for (SectAlignOption &opt : ctx.arg.sectalign)
+    if (Chunk<E> *chunk = find_section(ctx, opt.segname, opt.sectname))
+      chunk->hdr.p2align = opt.p2align;
+
   bool has_pagezero_seg = ctx.arg.pagezero_size;
   for (i64 i = 0; i < ctx.segments.size(); i++)
     ctx.segments[i]->seg_idx = (has_pagezero_seg ? i + 1 : i);
@@ -895,6 +971,10 @@ static int do_main(int argc, char **argv) {
     compute_uuid(ctx);
 
   ctx.output_file->close(ctx);
+
+  if (!ctx.arg.dependency_info.empty())
+    write_dependency_info(ctx);
+
   ctx.checkpoint();
   t.stop();
 
