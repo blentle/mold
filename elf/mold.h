@@ -1524,7 +1524,6 @@ struct Context {
     bool z_execstack = false;
     bool z_execstack_if_needed = false;
     bool z_ibt = false;
-    bool z_ibtplt = false;
     bool z_initfirst = false;
     bool z_interpose = false;
     bool z_keep_text_section_prefix = false;
@@ -1575,8 +1574,6 @@ struct Context {
   std::vector<VersionPattern> version_patterns;
   u16 default_version = VER_NDX_GLOBAL;
   i64 page_size = -1;
-  i64 plt_hdr_size = -1;
-  i64 plt_size = -1;
 
   // Reader context
   bool as_needed = false;
@@ -1690,6 +1687,7 @@ struct Context {
   Symbol<E> *_TLS_MODULE_BASE_ = nullptr;
   Symbol<E> *__GNU_EH_FRAME_HDR = nullptr;
   Symbol<E> *__bss_start = nullptr;
+  Symbol<E> *__dso_handle = nullptr;
   Symbol<E> *__ehdr_start = nullptr;
   Symbol<E> *__executable_start = nullptr;
   Symbol<E> *__exidx_end = nullptr;
@@ -2389,7 +2387,7 @@ inline u64 Symbol<E>::get_tlsdesc_addr(Context<E> &ctx) const {
 template <typename E>
 inline u64 Symbol<E>::get_plt_addr(Context<E> &ctx) const {
   if (i32 idx = get_plt_idx(ctx); idx != -1)
-    return ctx.plt->shdr.sh_addr + ctx.plt_hdr_size + idx * ctx.plt_size;
+    return ctx.plt->shdr.sh_addr + E::plt_hdr_size + idx * E::plt_size;
   return ctx.pltgot->shdr.sh_addr + get_pltgot_idx(ctx) * E::pltgot_size;
 }
 

@@ -277,8 +277,9 @@ static std::vector<std::vector<u8>> create_load_commands(Context<E> &ctx) {
   vec.push_back(create_source_version_cmd(ctx));
   vec.push_back(create_function_starts_cmd(ctx));
 
-  for (DylibFile<E> *dylib : ctx.dylibs)
-    vec.push_back(create_load_dylib_cmd(ctx, *dylib));
+  for (DylibFile<E> *file : ctx.dylibs)
+    if (file->dylib_idx != BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE)
+      vec.push_back(create_load_dylib_cmd(ctx, *file));
 
   for (std::string_view rpath : ctx.arg.rpath)
     vec.push_back(create_rpath_cmd(ctx, rpath));
@@ -666,7 +667,8 @@ void RebaseSection<E>::compute_size(Context<E> &ctx) {
       if (chunk->is_output_section && !chunk->hdr.match("__TEXT", "__eh_frame"))
         for (Subsection<E> *subsec : ((OutputSection<E> *)chunk)->members)
           for (Relocation<E> &rel : subsec->get_rels())
-            if (!rel.is_pcrel && rel.type == E::abs_rel && !refers_tls(rel.sym))
+            if (!rel.is_pcrel && !rel.is_subtracted && rel.type == E::abs_rel &&
+                !refers_tls(rel.sym))
               enc.add(seg->seg_idx,
                       subsec->get_addr(ctx) + rel.offset - seg->cmd.vmaddr);
 
@@ -1170,6 +1172,63 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
 }
 
 template <typename E>
+static bool has_objc_image_info_section(Context<E> &ctx) {
+  return false;
+}
+
+// Create __DATA,__objc_imageinfo section contents by merging input
+// __objc_imageinfo sections.
+template <typename E>
+std::unique_ptr<ObjcImageInfoSection<E>>
+ObjcImageInfoSection<E>::create(Context<E> &ctx) {
+  ObjcImageInfo *first = nullptr;
+
+  for (ObjectFile<E> *file : ctx.objs) {
+    if (file->objc_image_info) {
+      first = file->objc_image_info;
+      break;
+    }
+  }
+
+  if (!first)
+    return nullptr;
+
+  ObjcImageInfo info;
+  info.flags = (first->flags & OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES);
+
+  for (ObjectFile<E> *file : ctx.objs) {
+    if (!file->objc_image_info)
+      continue;
+
+    ObjcImageInfo &info2 = *file->objc_image_info;
+
+    // Make sure that all object files have the same flag.
+    if ((info.flags & OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES) !=
+        (info2.flags & OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES))
+      Error(ctx) << *file << ": incompatible __objc_imageinfo flag";
+
+    // Make sure that all object files have the same Swift version.
+    if (info.swift_version == 0)
+      info.swift_version = info2.swift_version;
+
+    if (info.swift_version != info2.swift_version && info2.swift_version != 0)
+      Error(ctx) << *file << ": incompatible __objc_imageinfo swift version"
+                 << (u32)info.swift_version << " " << (u32)info2.swift_version;
+
+    // swift_lang_version is set to the newest.
+    info.swift_lang_version =
+      std::max<u32>(info.swift_lang_version, info2.swift_lang_version);
+  }
+
+  return std::make_unique<ObjcImageInfoSection<E>>(ctx, info);
+}
+
+template <typename E>
+void ObjcImageInfoSection<E>::copy_buf(Context<E> &ctx) {
+  memcpy(ctx.buf + this->hdr.offset, &contents, sizeof(contents));
+}
+
+template <typename E>
 void CodeSignatureSection<E>::compute_size(Context<E> &ctx) {
   std::string filename = filepath(ctx.arg.final_output).filename();
   i64 filename_size = align_to(filename.size() + 1, 16);
@@ -1578,6 +1637,7 @@ void SectCreateSection<E>::copy_buf(Context<E> &ctx) {
   template class SymtabSection<E>;                      \
   template class StrtabSection<E>;                      \
   template class CodeSignatureSection<E>;               \
+  template class ObjcImageInfoSection<E>;               \
   template class DataInCodeSection<E>;                  \
   template class StubsSection<E>;                       \
   template class StubHelperSection<E>;                  \

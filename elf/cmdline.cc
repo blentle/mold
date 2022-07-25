@@ -1,6 +1,7 @@
 #include "mold.h"
 #include "../cmdline.h"
 
+#include <regex>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -73,11 +74,14 @@ Options:
   --enable-new-dtags          Emit DT_RUNPATH for --rpath (default)
     --disable-new-dtags       Emit DT_RPATH for --rpath
   --dp                        Ignored
-  --dynamic-list              Read a list of dynamic symbols
+  --dynamic-list              Read a list of dynamic symbols (implies -Bsymbolic)
   --eh-frame-hdr              Create .eh_frame_hdr section
     --no-eh-frame-hdr
   --enable-new-dtags          Ignored
   --exclude-libs LIB,LIB,..   Mark all symbols in given libraries hidden
+  --export-dynamic-symbol     Put symbols matching glob in the dynamic symbol table
+  --export-dynamic-symbol-list
+                              Read a list of dynamic symbols
   --fatal-warnings            Treat warnings as errors
     --no-fatal-warnings       Do not treat warnings as errors (default)
   --fini SYMBOL               Call SYMBOL at unload-time
@@ -201,11 +205,13 @@ static std::vector<std::string> add_dashes(std::string name) {
 
 template <typename E>
 static i64 parse_hex(Context<E> &ctx, std::string opt, std::string_view value) {
-  if (value.starts_with("0x") || value.starts_with("0X"))
-    value = value.substr(2);
-  if (value.find_first_not_of("0123456789abcdefABCDEF") != value.npos)
+  auto flags = std::regex_constants::optimize | std::regex_constants::ECMAScript;
+  static std::regex re(R"((?:0x|0X)?([0-9a-fA-F]+))", flags);
+
+  std::cmatch m;
+  if (!std::regex_match(value.begin(), value.end(), m, re))
     Fatal(ctx) << "option -" << opt << ": not a hexadecimal number";
-  return std::stoul(std::string(value), nullptr, 16);
+  return std::stoul(m[1], nullptr, 16);
 }
 
 template <typename E>
@@ -227,13 +233,11 @@ static i64 parse_number(Context<E> &ctx, std::string opt,
 }
 
 template <typename E>
-static std::vector<u8> parse_hex_build_id(Context<E> &ctx,
-                                          std::string_view arg) {
-  assert(arg.starts_with("0x") || arg.starts_with("0X"));
+static std::vector<u8> parse_hex_build_id(Context<E> &ctx, std::string_view arg) {
+  auto flags = std::regex_constants::optimize | std::regex_constants::ECMAScript;
+  static std::regex re(R"(0[xX]([0-9a-fA-F][0-9a-fA-F])+)", flags);
 
-  if (arg.size() % 2)
-    Fatal(ctx) << "invalid build-id: " << arg;
-  if (arg.substr(2).find_first_not_of("0123456789abcdefABCDEF") != arg.npos)
+  if (!std::regex_match(arg.begin(), arg.end(), re))
     Fatal(ctx) << "invalid build-id: " << arg;
 
   arg = arg.substr(2);
@@ -247,9 +251,9 @@ static std::vector<u8> parse_hex_build_id(Context<E> &ctx,
     return c - 'A' + 10;
   };
 
-  std::vector<u8> vec(arg.size() / 2);
-  for (i64 i = 0; i < vec.size(); i++)
-    vec[i] = (fn(arg[i * 2]) << 4) | fn(arg[i * 2 + 1]);
+  std::vector<u8> vec;
+  for (i64 i = 0; i < arg.size(); i += 2)
+    vec.push_back((fn(arg[i]) << 4) | fn(arg[i + 1]));
   return vec;
 }
 
@@ -315,28 +319,6 @@ parse_defsym_value(Context<E> &ctx, std::string_view s) {
   if (s.find_first_not_of("0123456789") == s.npos)
     return (u64)std::stoull(std::string(s), nullptr, 10);
   return get_symbol(ctx, s);
-}
-
-// Returns a PLT header size and a PLT entry size.
-template <typename E>
-static std::pair<i64, i64> get_plt_size(Context<E> &ctx) {
-  if constexpr (std::is_same_v<E, X86_64>) {
-    if (ctx.arg.z_now)
-      return {0, 8};
-    if (ctx.arg.z_ibtplt)
-      return {32, 16};
-    return {16, 16};
-  }
-
-  if constexpr (std::is_same_v<E, I386>)
-    return {16, 16};
-  if constexpr (std::is_same_v<E, ARM64>)
-    return {32, 16};
-  if constexpr (std::is_same_v<E, ARM32>)
-    return {32, 16};
-  if constexpr (std::is_same_v<E, RISCV64>)
-    return {32, 16};
-  unreachable();
 }
 
 template <typename E>
@@ -717,9 +699,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.z_interpose = true;
     } else if (read_z_flag("ibt")) {
       ctx.arg.z_ibt = true;
-      ctx.arg.z_ibtplt = true;
     } else if (read_z_flag("ibtplt")) {
-      ctx.arg.z_ibtplt = true;
     } else if (read_z_flag("muldefs")) {
       ctx.arg.allow_multiple_definition = true;
     } else if (read_z_flag("keep-text-section-prefix")) {
@@ -907,9 +887,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_arg("format") || read_arg("b")) {
       if (arg == "binary")
         Fatal(ctx)
-          << "mold does not suppor `-b binary`. If you want to convert a binary"
-          << " file into an object file, use `objcopy -I binary -O default"
-          << " <input-file> <output-file.o>` instead.";
+          << "mold does not support `-b binary`. If you want to convert a"
+          << " binary file into an object file, use `objcopy -I binary -O"
+          << " default <input-file> <output-file.o>` instead.";
       Fatal(ctx) << "unknown command line option: -b " << arg;
     } else if (read_arg("auxiliary") || read_arg("f")) {
       ctx.arg.auxiliary.push_back(arg);
@@ -955,9 +935,21 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_z_arg("common-page-size")) {
     } else if (read_flag("no-keep-memory")) {
     } else if (read_arg("version-script")) {
+      // --version-script, --dynamic-list and --export-dynamic-symbol[-list]
+      // are treated as positional arguments even if they are actually not
+      // positional. This is because linker scripts (a positional argument)
+      // can also specify a version script, and it's better to consolidate
+      // parsing in read_input_files. In particular, version scripts can
+      // modify ctx.default_version which we initialize *after* parsing
+      // non-positional args, so the parsing cannot be done right here.
       remaining.push_back("--version-script=" + std::string(arg));
     } else if (read_arg("dynamic-list")) {
+      ctx.arg.Bsymbolic = true;
       remaining.push_back("--dynamic-list=" + std::string(arg));
+    } else if (read_arg("export-dynamic-symbol")) {
+      remaining.push_back("--export-dynamic-symbol=" + std::string(arg));
+    } else if (read_arg("export-dynamic-symbol-list")) {
+      remaining.push_back("--export-dynamic-symbol-list=" + std::string(arg));
     } else if (read_flag("as-needed")) {
       remaining.push_back("--as-needed");
     } else if (read_flag("no-as-needed")) {
@@ -997,7 +989,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     }
   }
 
-  // Remove redundant `/..` or `/.` from library paths.
+  // Clean library paths by removing redundant `/..` and `/.`
+  // so that they are easier to read in log messages.
   for (std::string &path : ctx.arg.library_paths)
     path = path_clean(path);
 
@@ -1045,8 +1038,6 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
 
   if (ctx.arg.shared && warn_shared_textrel)
     ctx.arg.warn_textrel = true;
-
-  std::tie(ctx.plt_hdr_size, ctx.plt_size) = get_plt_size(ctx);
 
   ctx.arg.undefined.push_back(ctx.arg.entry);
 

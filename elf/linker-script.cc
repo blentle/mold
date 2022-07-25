@@ -395,15 +395,15 @@ void parse_dynamic_list(Context<E> &ctx, std::string path) {
     SyntaxError(ctx, tok[0]) << "trailing garbage token";
 }
 
-#define INSTANTIATE(E)                                                  \
-  template                                                              \
-  void parse_linker_script(Context<E> &ctx, MappedFile<Context<E>> *mf); \
-  template                                                              \
-  i64 get_script_output_type(Context<E> &ctx, MappedFile<Context<E>> *mf); \
-  template                                                              \
-  void parse_version_script(Context<E> &ctx, std::string path);         \
-  template                                                              \
-  void parse_dynamic_list(Context<E> &ctx, std::string path)
+#define INSTANTIATE(E)                                                          \
+  template                                                                      \
+  void parse_linker_script(Context<E> &ctx, MappedFile<Context<E>> *mf);        \
+  template                                                                      \
+  i64 get_script_output_type(Context<E> &ctx, MappedFile<Context<E>> *mf);      \
+  template                                                                      \
+  void parse_version_script(Context<E> &ctx, std::string path);                 \
+  template                                                                      \
+  void parse_dynamic_list(Context<E> &ctx, std::string path);
 
 INSTANTIATE_ALL;
 

@@ -904,6 +904,7 @@ static std::vector<T> encode_relr(const std::vector<T> &pos) {
 
   for (i64 i = 0; i < pos.size();) {
     assert(i == 0 || pos[i - 1] <= pos[i]);
+    assert(pos[i] % sizeof(T) == 0);
 
     vec.push_back(pos[i]);
     u64 base = pos[i] + sizeof(T);
@@ -1137,19 +1138,10 @@ void GotPltSection<E>::copy_buf(Context<E> &ctx) {
   buf[2] = 0;
 
   auto get_plt_resolver_addr = [&](Symbol<E> &sym) -> u64 {
-    if constexpr (std::is_same_v<E, ARM64> || std::is_same_v<E, ARM32> ||
-                  std::is_same_v<E, RISCV64>)
-      return ctx.plt->shdr.sh_addr;
-
-    if constexpr (std::is_same_v<E, X86_64>) {
-      if (ctx.arg.z_ibtplt)
-        return ctx.plt->shdr.sh_addr;
-      return sym.get_plt_addr(ctx) + 6;
-    }
-
     if constexpr (std::is_same_v<E, I386>)
       return sym.get_plt_addr(ctx) + 6;
-    unreachable();
+    else
+      return ctx.plt->shdr.sh_addr;
   };
 
   for (Symbol<E> *sym : ctx.plt->symbols)
@@ -1161,10 +1153,10 @@ void PltSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
   assert(!sym->has_plt(ctx));
 
   if (this->shdr.sh_size == 0)
-    this->shdr.sh_size = ctx.plt_hdr_size;
+    this->shdr.sh_size = E::plt_hdr_size;
 
   sym->set_plt_idx(ctx, symbols.size());
-  this->shdr.sh_size += ctx.plt_size;
+  this->shdr.sh_size += E::plt_size;
   symbols.push_back(sym);
 
   sym->set_gotplt_idx(ctx, ctx.gotplt->shdr.sh_size / E::word_size);

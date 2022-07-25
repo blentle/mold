@@ -106,8 +106,8 @@ static void write_plt_header(Context<E> &ctx) {
 }
 
 static void write_plt_entry(Context<E> &ctx, Symbol<E> &sym) {
-  u8 *ent = ctx.buf + ctx.plt->shdr.sh_offset + ctx.plt_hdr_size +
-            sym.get_plt_idx(ctx) * ctx.plt_size;
+  u8 *ent = ctx.buf + ctx.plt->shdr.sh_offset + E::plt_hdr_size +
+            sym.get_plt_idx(ctx) * E::plt_size;
 
   static const u32 data[] = {
     0x00000e17, // auipc   t3, %pcrel_hi(function@.got.plt)
@@ -679,7 +679,7 @@ static void relax_section(Context<E> &ctx, InputSection<E> &isec) {
     const ElfRel<E> &r = rels[i];
     i64 delta2 = 0;
 
-    isec.extra.r_deltas[i] += delta;
+    isec.extra.r_deltas[i] = delta;
 
     switch (r.r_type) {
     case R_RISCV_ALIGN: {
@@ -725,7 +725,7 @@ static void relax_section(Context<E> &ctx, InputSection<E> &isec) {
 
   for (Symbol<E> *sym : syms)
     sym->value += delta;
-  isec.extra.r_deltas[rels.size()] += delta;
+  isec.extra.r_deltas[rels.size()] = delta;
 
   isec.sh_size += delta;
 }

@@ -95,12 +95,11 @@ read_relocations(Context<E> &ctx, ObjectFile<E> &file,
     vec.push_back({r.offset, (u8)r.type, (u8)r.p2size});
     Relocation<E> &rel = vec.back();
 
-    if (rels[i].type == X86_64_RELOC_SUBTRACTOR ||
-        (i > 0 && rels[i - 1].type == X86_64_RELOC_SUBTRACTOR)) {
-      rel.is_pcrel = false;
-    } else {
+    if (i > 0 && rels[i - 1].type == X86_64_RELOC_SUBTRACTOR)
+      rel.is_subtracted = true;
+
+    if (!rel.is_subtracted && rels[i].type != X86_64_RELOC_SUBTRACTOR)
       rel.is_pcrel = r.is_pcrel;
-    }
 
     if (r.is_extern) {
       rel.sym = file.syms[r.idx];
@@ -198,13 +197,13 @@ void Subsection<E>::apply_reloc(Context<E> &ctx, u8 *buf) {
       Fatal(ctx) << isec << ": unknown reloc: " << (int)r.type;
     }
 
-    // An address of a thread-local variable is computed as an offset
-    // to the beginning of the first thread-local section.
-    if (isec.hdr.type == S_THREAD_LOCAL_VARIABLES)
+    if (isec.hdr.type == S_THREAD_LOCAL_VARIABLES) {
+      // An address of a thread-local variable is computed as an offset
+      // to the beginning of the first thread-local section.
       val -= ctx.tls_begin;
-
-    if (r.is_pcrel)
+    } else if (r.is_pcrel) {
       val -= get_addr(ctx) + r.offset + 4 + get_reloc_addend(r.type);
+    }
 
     if (r.p2size == 2)
       *(ul32 *)(buf + r.offset) = val;

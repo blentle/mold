@@ -114,6 +114,7 @@ static void create_internal_file(Context<E> &ctx) {
   obj->mach_syms = obj->mach_syms2;
   ctx.obj_pool.emplace_back(obj);
   ctx.objs.push_back(obj);
+  ctx.internal_obj = obj;
 
   auto add = [&](std::string_view name) {
     Symbol<E> *sym = get_symbol(ctx, name);
@@ -143,6 +144,27 @@ static void create_internal_file(Context<E> &ctx) {
   }
 
   add("___dso_handle");
+
+  // Add start stop symbols.
+  std::set<std::string_view> start_stop_symbols;
+  std::mutex mu;
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    std::set<std::string_view> set;
+    for (Symbol<E> *sym : file->syms)
+      if (!sym->file)
+        if (sym->name.starts_with("segment$start$") ||
+            sym->name.starts_with("segment$end$") ||
+            sym->name.starts_with("section$start$") ||
+            sym->name.starts_with("section$end$"))
+          set.insert(sym->name);
+
+    std::scoped_lock lock(mu);
+    start_stop_symbols.merge(set);
+  });
+
+  for (std::string_view name : start_stop_symbols)
+    add(name);
 }
 
 // Remove unreferenced subsections to eliminate code and data
@@ -204,7 +226,6 @@ static bool compare_chunks(const Chunk<E> *a, const Chunk<E> *b) {
     // __TEXT
     "__mach_header",
     "__text",
-    "__StaticInit",
     "__stubs",
     "__stub_helper",
     "__gcc_except_tab",
@@ -288,105 +309,6 @@ static void claim_unresolved_symbols(Context<E> &ctx) {
 }
 
 template <typename E>
-static void merge_cstring_sections(Context<E> &ctx) {
-  Timer t(ctx, "merge_cstring_sections");
-
-  struct Entry {
-    Entry(Subsection<E> *subsec) : owner(subsec) {}
-
-    Entry(const Entry &other) :
-      owner(other.owner.load()), p2align(other.p2align.load()) {}
-
-    std::atomic<Subsection<E> *> owner = nullptr;
-    std::atomic_uint8_t p2align = 0;
-  };
-
-  struct SubsecRef {
-    Subsection<E> &subsec;
-    u64 hash = 0;
-    Entry *ent = nullptr;
-  };
-
-  std::vector<std::vector<SubsecRef>> vec(ctx.objs.size());
-
-  // Estimate the number of unique strings.
-  HyperLogLog estimator;
-
-  tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    ObjectFile<E> *file = ctx.objs[i];
-    HyperLogLog e;
-
-    for (Subsection<E> *subsec : file->subsections) {
-      if (&subsec->isec.osec == ctx.cstring) {
-        std::string_view str = subsec->get_contents();
-        u64 h = hash_string(str);
-        vec[i].push_back({*subsec, h, nullptr});
-        estimator.insert(h);
-      }
-    }
-    estimator.merge(e);
-  });
-
-  // Create a hash map large enough to hold all strings.
-  ConcurrentMap<Entry> map(estimator.get_cardinality() * 3 / 2);
-
-  // Insert all strings into the hash table.
-  tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    ObjectFile<E> *file = ctx.objs[i];
-
-    for (i64 j = 0; j < vec[i].size(); j++) {
-      SubsecRef &ref = vec[i][j];
-      std::string_view s = ref.subsec.get_contents();
-      ref.ent = map.insert(s, ref.hash, {&ref.subsec}).first;
-
-      Subsection<E> *existing = ref.ent->owner;
-      while (existing->isec.file.priority < file->priority &&
-             !ref.ent->owner.compare_exchange_weak(existing, &ref.subsec));
-
-      update_maximum(ref.ent->p2align, ref.subsec.p2align.load());
-    }
-  });
-
-  // Decide who will become the owner for each subsection.
-  tbb::parallel_for((i64)0, (i64)ctx.objs.size(), [&](i64 i) {
-    for (i64 j = 0; j < vec[i].size(); j++) {
-      SubsecRef &ref = vec[i][j];
-      if (ref.ent->owner != &ref.subsec) {
-        ref.subsec.is_coalesced = true;
-        ref.subsec.replacer = ref.ent->owner;
-
-        static Counter counter("num_merged_strings");
-        counter++;
-      }
-    }
-  });
-
-  // Merge strings
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (std::unique_ptr<InputSection<E>> &isec : file->sections)
-      if (isec)
-        for (Relocation<E> &r : isec->rels)
-          if (r.subsec && r.subsec->is_coalesced)
-            r.subsec = r.subsec->replacer;
-  });
-
-  auto replace = [&](InputFile<E> *file) {
-    for (Symbol<E> *sym : file->syms)
-      if (sym->subsec && sym->subsec->is_coalesced)
-        sym->subsec = sym->subsec->replacer;
-  };
-
-  tbb::parallel_for_each(ctx.objs, replace);
-  tbb::parallel_for_each(ctx.dylibs, replace);
-
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    std::erase_if(file->subsections, [](Subsection<E> *subsec) {
-      return subsec->is_coalesced;
-    });
-  });
-}
-
-template <typename E>
 static Chunk<E> *find_section(Context<E> &ctx, std::string_view segname,
                               std::string_view sectname) {
   for (Chunk<E> *chunk : ctx.chunks)
@@ -398,6 +320,9 @@ static Chunk<E> *find_section(Context<E> &ctx, std::string_view segname,
 template <typename E>
 static void create_synthetic_chunks(Context<E> &ctx) {
   Timer t(ctx, "create_synthetic_chunks");
+
+  // Create a __DATA,__objc_imageinfo section.
+  ctx.image_info = ObjcImageInfoSection<E>::create(ctx);
 
   // Handle -sectcreate
   for (SectCreateOption arg : ctx.arg.sectcreate) {
@@ -444,6 +369,109 @@ static void create_synthetic_chunks(Context<E> &ctx) {
 
   for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
     sort(seg->chunks, compare_chunks<E>);
+}
+
+template <typename E>
+static void uniquify_cstrings(Context<E> &ctx, OutputSection<E> &osec) {
+  Timer t(ctx, "uniquify_cstrings");
+
+  struct Entry {
+    Entry(Subsection<E> *subsec) : owner(subsec) {}
+
+    Entry(const Entry &other) :
+      owner(other.owner.load()), p2align(other.p2align.load()) {}
+
+    std::atomic<Subsection<E> *> owner = nullptr;
+    std::atomic_uint8_t p2align = 0;
+  };
+
+  struct SubsecRef {
+    Subsection<E> *subsec = nullptr;
+    u64 hash = 0;
+    Entry *ent = nullptr;
+  };
+
+  std::vector<SubsecRef> vec(osec.members.size());
+
+  // Estimate the number of unique strings.
+  tbb::enumerable_thread_specific<HyperLogLog> estimators;
+
+  tbb::parallel_for((i64)0, (i64)osec.members.size(), [&](i64 i) {
+    Subsection<E> *subsec = osec.members[i];
+    if (subsec->is_cstring) {
+      u64 h = hash_string(subsec->get_contents());
+      vec[i].subsec = subsec;
+      vec[i].hash = h;
+      estimators.local().insert(h);
+    }
+  });
+
+  HyperLogLog estimator;
+  for (HyperLogLog &e : estimators)
+    estimator.merge(e);
+
+  // Create a hash map large enough to hold all strings.
+  ConcurrentMap<Entry> map(estimator.get_cardinality() * 3 / 2);
+
+  // Insert all strings into the hash table.
+  tbb::parallel_for_each(vec, [&](SubsecRef &ref) {
+    if (ref.subsec) {
+      std::string_view s = ref.subsec->get_contents();
+      ref.ent = map.insert(s, ref.hash, {ref.subsec}).first;
+
+      Subsection<E> *existing = ref.ent->owner;
+      while (existing->isec.file.priority < ref.subsec->isec.file.priority &&
+             !ref.ent->owner.compare_exchange_weak(existing, ref.subsec));
+
+      update_maximum(ref.ent->p2align, ref.subsec->p2align.load());
+    }
+  });
+
+  // Decide who will become the owner for each subsection.
+  tbb::parallel_for_each(vec, [&](SubsecRef &ref) {
+    if (ref.subsec && ref.subsec != ref.ent->owner) {
+      ref.subsec->is_coalesced = true;
+      ref.subsec->replacer = ref.ent->owner;
+    }
+  });
+
+  static Counter counter("num_merged_strings");
+  counter += std::erase_if(osec.members, [](Subsection<E> *subsec) {
+    return subsec->is_coalesced;
+  });
+}
+
+template <typename E>
+static void merge_cstring_sections(Context<E> &ctx) {
+  Timer t(ctx, "merge_cstring_sections");
+
+  for (Chunk<E> *chunk : ctx.chunks)
+    if (chunk->is_output_section && chunk->hdr.type == S_CSTRING_LITERALS)
+      uniquify_cstrings(ctx, *(OutputSection<E> *)chunk);
+
+  // Rewrite relocations and symbols.
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    for (std::unique_ptr<InputSection<E>> &isec : file->sections)
+      if (isec)
+        for (Relocation<E> &r : isec->rels)
+          if (r.subsec && r.subsec->is_coalesced)
+            r.subsec = r.subsec->replacer;
+  });
+
+  std::vector<InputFile<E> *> files;
+  append(files, ctx.objs);
+  append(files, ctx.dylibs);
+
+  for (InputFile<E> *file: files)
+    for (Symbol<E> *sym : file->syms)
+      if (sym && sym->subsec && sym->subsec->is_coalesced)
+        sym->subsec = sym->subsec->replacer;
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    std::erase_if(file->subsections, [](Subsection<E> *subsec) {
+      return subsec->is_coalesced;
+    });
+  });
 }
 
 template <typename E>
@@ -527,6 +555,54 @@ static void fix_synthetic_symbol_values(Context<E> &ctx) {
   get_symbol(ctx, "__mh_dylib_header")->value = ctx.data->hdr.addr;
   get_symbol(ctx, "__mh_bundle_header")->value = ctx.data->hdr.addr;
   get_symbol(ctx, "___dso_handle")->value = ctx.data->hdr.addr;
+
+  auto find_segment = [&](std::string_view name) -> SegmentCommand * {
+    for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
+      if (seg->cmd.get_segname() == name)
+        return &seg->cmd;
+    return nullptr;
+  };
+
+  auto find_section = [&](std::string_view name) -> MachSection * {
+    size_t pos = name.find('$');
+    if (pos == name.npos)
+      return nullptr;
+
+    std::string_view segname = name.substr(0, pos);
+    std::string_view sectname = name.substr(pos + 1);
+
+    for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
+      for (Chunk<E> *chunk : seg->chunks)
+        if (chunk->hdr.match(segname, sectname))
+          return &chunk->hdr;
+    return nullptr;
+  };
+
+  for (Symbol<E> *sym : ctx.internal_obj->syms) {
+    if (std::string_view s = "segment$start$"; sym->name.starts_with(s)) {
+      sym->value = ctx.text->hdr.addr;
+      if (SegmentCommand *cmd = find_segment(sym->name.substr(s.size())))
+        sym->value = cmd->vmaddr;
+    }
+
+    if (std::string_view s = "segment$end$"; sym->name.starts_with(s)) {
+      sym->value = ctx.text->hdr.addr;
+      if (SegmentCommand *cmd = find_segment(sym->name.substr(s.size())))
+        sym->value = cmd->vmaddr + cmd->vmsize;
+    }
+
+    if (std::string_view s = "section$start$"; sym->name.starts_with(s)) {
+      sym->value = ctx.text->hdr.addr;
+      if (MachSection *hdr = find_section(sym->name.substr(s.size())))
+        sym->value = hdr->addr;
+    }
+
+    if (std::string_view s = "section$end$"; sym->name.starts_with(s)) {
+      sym->value = ctx.text->hdr.addr;
+      if (MachSection *hdr = find_section(sym->name.substr(s.size())))
+        sym->value = hdr->addr + hdr->size;
+    }
+  }
 }
 
 template <typename E>
@@ -642,14 +718,16 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   switch (get_file_type(mf)) {
   case FileType::TAPI:
   case FileType::MACH_DYLIB:
-    ctx.dylibs.push_back(DylibFile<E>::create(ctx, mf));
+  case FileType::MACH_EXE:
+    if (ctx.loaded_files.insert(mf->name).second)
+      ctx.dylibs.push_back(DylibFile<E>::create(ctx, mf));
     break;
   case FileType::MACH_OBJ:
   case FileType::LLVM_BITCODE:
     ctx.objs.push_back(ObjectFile<E>::create(ctx, mf, ""));
     break;
   case FileType::AR:
-    if (!ctx.all_load && !ctx.loaded_archives.insert(mf->name).second) {
+    if (!ctx.all_load && !ctx.loaded_files.insert(mf->name).second) {
       // If the same .a file is specified more than once, ignore all
       // but the first one because they would be ignored anyway.
       break;
@@ -779,6 +857,10 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     ctx.reexport_l = false;
   }
 
+  // With -bundle_loader, we can import symbols from a main executable.
+  if (!ctx.arg.bundle_loader.empty())
+    read_file(ctx, MappedFile<Context<E>>::must_open(ctx, ctx.arg.bundle_loader));
+
   // An object file can contain linker directives to load other object
   // files or libraries, so process them if any.
   for (i64 i = 0; i < ctx.objs.size(); i++) {
@@ -806,8 +888,9 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   for (DylibFile<E> *dylib : ctx.dylibs)
     dylib->priority = ctx.file_priority++;
 
-  for (i64 i = 0; i < ctx.dylibs.size(); i++)
-    ctx.dylibs[i]->dylib_idx = i + 1;
+  for (i64 i = 1; DylibFile<E> *file : ctx.dylibs)
+    if (file->dylib_idx != BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE)
+      file->dylib_idx = i++;
 }
 
 template <typename E>
@@ -930,12 +1013,11 @@ static int do_main(int argc, char **argv) {
 
   claim_unresolved_symbols(ctx);
 
-  merge_cstring_sections(ctx);
-
   if (ctx.arg.dead_strip)
     dead_strip(ctx);
 
   create_synthetic_chunks(ctx);
+  merge_cstring_sections(ctx);
 
   for (ObjectFile<E> *file : ctx.objs)
     file->check_duplicate_symbols(ctx);
