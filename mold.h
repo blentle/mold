@@ -18,21 +18,26 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/enumerable_thread_specific.h>
-#include <unistd.h>
 #include <vector>
 
+#ifdef _WIN32
+# include <io.h>
+#else
+# include <sys/mman.h>
+# include <unistd.h>
+#endif
+
 #define XXH_INLINE_ALL 1
-#include <xxhash/xxhash.h>
+#include "third-party/xxhash/xxhash.h"
 
 #ifdef NDEBUG
-#  define unreachable() __builtin_unreachable()
+# define unreachable() __builtin_unreachable()
 #else
-#  define unreachable() assert(0 && "unreachable")
+# define unreachable() assert(0 && "unreachable")
 #endif
 
 inline uint64_t hash_string(std::string_view str) {
@@ -74,7 +79,8 @@ inline thread_local bool opt_demangle;
 inline u8 *output_buffer_start = nullptr;
 inline u8 *output_buffer_end = nullptr;
 
-extern const std::string mold_version;
+inline std::string mold_version;
+extern std::string mold_git_hash;
 
 std::string_view errno_string();
 void cleanup();
@@ -284,6 +290,20 @@ inline void encode_uleb(std::vector<u8> &vec, u64 val) {
   } while (val);
 }
 
+inline void encode_sleb(std::vector<u8> &vec, i64 val) {
+  for (;;) {
+    u8 byte = val & 0x7f;
+    val >>= 7;
+
+    bool neg = (byte & 0x40);
+    if ((val == 0 && !neg) || (val == -1 && neg)) {
+      vec.push_back(byte);
+      break;
+    }
+    vec.push_back(byte | 0x80);
+  }
+}
+
 inline i64 write_uleb(u8 *buf, u64 val) {
   i64 i = 0;
   do {
@@ -310,8 +330,18 @@ inline u64 read_uleb(u8 const*&buf) {
   return read_uleb(const_cast<u8 *&>(buf));
 }
 
+inline u64 read_uleb(std::string_view &str) {
+  u8 *start = (u8 *)&str[0];
+  u8 *ptr = start;
+  u64 val = read_uleb(ptr);
+  str = str.substr(ptr - start);
+  return val;
+}
+
 inline i64 uleb_size(u64 val) {
+#if __GNUC__
 #pragma GCC unroll 8
+#endif
   for (int i = 1; i < 9; i++)
     if (val < ((u64)1 << (7 * i)))
       return i;
@@ -325,6 +355,14 @@ std::string_view save_string(C &ctx, const std::string &str) {
   buf[str.size()] = '\0';
   ctx.string_pool.push_back(std::unique_ptr<u8[]>(buf));
   return {(char *)buf, str.size()};
+}
+
+inline bool remove_prefix(std::string_view &s, std::string_view prefix) {
+  if (s.starts_with(prefix)) {
+    s = s.substr(prefix.size());
+    return true;
+  }
+  return false;
 }
 
 //
@@ -737,6 +775,9 @@ public:
   MappedFile *parent = nullptr;
   MappedFile *thin_parent = nullptr;
   int fd = -1;
+#ifdef _WIN32
+  HANDLE file_handle = INVALID_HANDLE_VALUE;
+#endif
 };
 
 template <typename C>
@@ -744,7 +785,14 @@ MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
   if (path.starts_with('/') && !ctx.arg.chroot.empty())
     path = ctx.arg.chroot + "/" + path_clean(path);
 
-  i64 fd = ::open(path.c_str(), O_RDONLY);
+
+  i64 fd;
+#ifdef _WIN32
+    fd = ::_open(path.c_str(), O_RDONLY);
+#else
+    fd = ::open(path.c_str(), O_RDONLY);
+#endif
+
   if (fd == -1)
     return nullptr;
 
@@ -758,18 +806,32 @@ MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
   mf->name = path;
   mf->size = st.st_size;
 
-#ifdef __APPLE__
-  mf->mtime = (u64)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec;
+#ifdef _WIN32
+    mf->mtime = st.st_mtime;
+#elif defined(__APPLE__)
+    mf->mtime = (u64)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec;
 #else
-  mf->mtime = (u64)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+    mf->mtime = (u64)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
 #endif
 
   if (st.st_size > 0) {
+#ifdef _WIN32
+    HANDLE handle = CreateFileMapping((HANDLE)_get_osfhandle(fd),
+                                      nullptr, PAGE_READWRITE, 0,
+                                      st.st_size, nullptr);
+    if (!handle)
+      Fatal(ctx) << path << ": CreateFileMapping failed: " << GetLastError();
+    mf->file_handle = handle;
+    mf->data = (u8 *)MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, st.st_size);
+    if (!mf->data)
+      Fatal(ctx) << path << ": MapViewOfFile failed: " << GetLastError();
+#else
     mf->data = (u8 *)mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE, fd, 0);
     if (mf->data == MAP_FAILED)
       Fatal(ctx) << path << ": mmap failed: " << errno_string();
-  }
+#endif
+    }
 
   close(fd);
   return mf;
@@ -797,8 +859,16 @@ MappedFile<C>::slice(C &ctx, std::string name, u64 start, u64 size) {
 
 template <typename C>
 MappedFile<C>::~MappedFile() {
-  if (size && !parent)
-    munmap(data, size);
+  if (size == 0 || parent)
+    return;
+
+#ifdef _WIN32
+  UnmapViewOfFile(data);
+  if (file_handle != INVALID_HANDLE_VALUE)
+    CloseHandle(file_handle);
+#else
+  munmap(data, size);
+#endif
 }
 
 } // namespace mold

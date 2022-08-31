@@ -34,7 +34,8 @@ template <typename E>
 void create_synthetic_sections(Context<E> &ctx) {
   auto push = [&]<typename T>(T *x) {
     ctx.chunks.push_back(x);
-    return std::unique_ptr<T>(x);
+    ctx.chunk_pool.emplace_back(x);
+    return x;
   };
 
   if (!ctx.arg.oformat_binary) {
@@ -351,29 +352,55 @@ void bin_sections(Context<E> &ctx) {
 // Create a dummy object file containing linker-synthesized
 // symbols.
 template <typename E>
-ObjectFile<E> *create_internal_file(Context<E> &ctx) {
+void create_internal_file(Context<E> &ctx) {
   ObjectFile<E> *obj = new ObjectFile<E>;
   ctx.obj_pool.emplace_back(obj);
+  ctx.internal_obj = obj;
+  ctx.objs.push_back(obj);
 
   // Create linker-synthesized symbols.
-  auto *esyms = new std::vector<ElfSym<E>>(1);
+  ctx.internal_esyms.resize(1);
+
   obj->symbols.push_back(new Symbol<E>);
   obj->first_global = 1;
   obj->is_alive = true;
   obj->features = -1;
   obj->priority = 1;
 
-  auto add = [&](std::string_view name, u8 st_type = STT_NOTYPE) {
+  // Add symbols for --defsym.
+  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
+    Symbol<E> *sym = ctx.arg.defsyms[i].first;
+    obj->symbols.push_back(sym);
+
     ElfSym<E> esym;
     memset(&esym, 0, sizeof(esym));
-    esym.st_type = st_type;
+    esym.st_type = STT_NOTYPE;
+    esym.st_shndx = SHN_ABS;
+    esym.st_bind = STB_GLOBAL;
+    esym.st_visibility = STV_DEFAULT;
+    ctx.internal_esyms.push_back(esym);
+  };
+
+  obj->elf_syms = ctx.internal_esyms;
+  obj->sym_fragments.resize(ctx.internal_esyms.size());
+  obj->symvers.resize(ctx.internal_esyms.size() - 1);
+}
+
+template <typename E>
+void add_synthetic_symbols(Context<E> &ctx) {
+  ObjectFile<E> &obj = *ctx.internal_obj;
+
+  auto add = [&](std::string_view name) {
+    ElfSym<E> esym;
+    memset(&esym, 0, sizeof(esym));
+    esym.st_type = STT_NOTYPE;
     esym.st_shndx = SHN_ABS;
     esym.st_bind = STB_GLOBAL;
     esym.st_visibility = STV_HIDDEN;
-    esyms->push_back(esym);
+    ctx.internal_esyms.push_back(esym);
 
     Symbol<E> *sym = get_symbol(ctx, name);
-    obj->symbols.push_back(sym);
+    obj.symbols.push_back(sym);
     return sym;
   };
 
@@ -391,12 +418,11 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
   ctx._etext = add("_etext");
   ctx._edata = add("_edata");
   ctx.__executable_start = add("__executable_start");
-  ctx.__dso_handle = add("__dso_handle");
 
   ctx.__rel_iplt_start =
-    add(E::is_rel ? "__rel_iplt_start" : "__rela_iplt_start");
+    add(is_rela<E> ? "__rela_iplt_start" : "__rel_iplt_start");
   ctx.__rel_iplt_end =
-    add(E::is_rel ? "__rel_iplt_end" : "__rela_iplt_end");
+    add(is_rela<E> ? "__rela_iplt_end" : "__rel_iplt_end");
 
   if (ctx.arg.eh_frame_hdr)
     ctx.__GNU_EH_FRAME_HDR = add("__GNU_EH_FRAME_HDR");
@@ -407,11 +433,13 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
     ctx.etext = add("etext");
   if (!get_symbol(ctx, "edata")->file)
     ctx.edata = add("edata");
+  if (!get_symbol(ctx, "__dso_handle")->file)
+    ctx.__dso_handle = add("__dso_handle");
 
-  if constexpr (E::supports_tlsdesc)
+  if constexpr (supports_tlsdesc<E>)
     ctx._TLS_MODULE_BASE_ = add("_TLS_MODULE_BASE_");
 
-  if constexpr (std::is_same_v<E, RISCV64>)
+  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>)
     if (!ctx.arg.shared)
       ctx.__global_pointer = add("__global_pointer$");
 
@@ -421,53 +449,30 @@ ObjectFile<E> *create_internal_file(Context<E> &ctx) {
   }
 
   for (Chunk<E> *chunk : ctx.chunks) {
-    if (!is_c_identifier(chunk->name))
-      continue;
-
-    add(save_string(ctx, "__start_" + std::string(chunk->name)));
-    add(save_string(ctx, "__stop_" + std::string(chunk->name)));
+    if (is_c_identifier(chunk->name)) {
+      add(save_string(ctx, "__start_" + std::string(chunk->name)));
+      add(save_string(ctx, "__stop_" + std::string(chunk->name)));
+    }
   }
 
-  i64 first_defsym = obj->symbols.size();
+  obj.elf_syms = ctx.internal_esyms;
+  obj.sym_fragments.resize(ctx.internal_esyms.size());
+  obj.symvers.resize(ctx.internal_esyms.size() - 1);
 
-  for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
-    Symbol<E> *sym = ctx.arg.defsyms[i].first;
-    ElfSym<E> esym;
-    memset(&esym, 0, sizeof(esym));
-    esym.st_type = STT_NOTYPE;
-    esym.st_shndx = SHN_ABS;
-    esym.st_bind = STB_GLOBAL;
-    esym.st_visibility = STV_DEFAULT;
-    esyms->push_back(esym);
-    obj->symbols.push_back(sym);
-  };
+  obj.resolve_symbols(ctx);
 
-  obj->elf_syms = *esyms;
-  obj->sym_fragments.resize(obj->elf_syms.size());
+  // Make all synthetic symbols relative ones.
+  for (Symbol<E> *sym : obj.symbols)
+    sym->shndx = -1; // dummy value to make it a relative symbol
 
-  i64 num_globals = obj->elf_syms.size() - obj->first_global;
-  obj->symvers.resize(num_globals);
-
-  obj->resolve_symbols(ctx);
-
-  for (i64 i = obj->first_global; i < first_defsym; i++)
-    obj->symbols[i]->shndx = -1; // dummy value to make it a relative symbol
-
+  // Make defsym symbols absolute if necessary.
   for (i64 i = 0; i < ctx.arg.defsyms.size(); i++) {
     Symbol<E> *sym = ctx.arg.defsyms[i].first;
     std::variant<Symbol<E> *, u64> val = ctx.arg.defsyms[i].second;
-
-    if (Symbol<E> **sym2 = std::get_if<Symbol<E> *>(&val))
-      if ((*sym2)->is_relative())
-        sym->shndx = -1; // dummy value to make it a relative symbol
+    if (std::holds_alternative<u64>(val) ||
+        std::get<Symbol<E> *>(val)->is_absolute())
+        sym->shndx = 0;
   }
-
-  ctx.on_exit.push_back([=] {
-    delete esyms;
-    delete obj->symbols[0];
-  });
-
-  return obj;
 }
 
 template <typename E>
@@ -581,7 +586,7 @@ static std::string create_response_file(Context<E> &ctx) {
   std::string buf;
   std::stringstream out;
 
-  std::string cwd = std::filesystem::current_path();
+  std::string cwd = std::filesystem::current_path().string();
   out << "-C " << cwd.substr(1) << "\n";
 
   if (cwd != "/") {
@@ -615,7 +620,7 @@ void write_repro_file(Context<E> &ctx) {
   std::unordered_set<std::string> seen;
   for (std::unique_ptr<MappedFile<Context<E>>> &mf : ctx.mf_pool) {
     if (!mf->parent) {
-      std::string path = to_abs_path(mf->name);
+      std::string path = to_abs_path(mf->name).string();
       if (seen.insert(path).second)
         tar->append(path, mf->get_contents());
     }
@@ -655,9 +660,9 @@ void sort_init_fini(Context<E> &ctx) {
 
   auto get_priority = [](InputSection<E> *isec) {
     static std::regex re(R"(\.(\d+)$)", std::regex_constants::optimize);
-    std::string name = isec->name().begin();
-    std::smatch m;
-    if (std::regex_search(name, m, re))
+    std::string_view name = isec->name();
+    std::cmatch m;
+    if (std::regex_search(name.data(), name.data() + name.size(), m, re))
       return std::stoi(m[1]);
     return 65536;
   };
@@ -921,21 +926,21 @@ void scan_rels(Context<E> &ctx) {
     if (sym->flags & NEEDS_GOT)
       ctx.got->add_got_symbol(ctx, sym);
 
-    if (sym->flags & NEEDS_PLT) {
-      if (sym->is_canonical) {
-        // A canonical PLT needs to be visible from DSOs.
-        sym->is_exported = true;
+    if (sym->flags & NEEDS_CPLT) {
+      sym->is_canonical = true;
 
-        // We can't use .plt.got for a canonical PLT because otherwise
-        // .plt.got and .got would refer each other, resulting in an
-        // infinite loop at runtime.
+      // A canonical PLT needs to be visible from DSOs.
+      sym->is_exported = true;
+
+      // We can't use .plt.got for a canonical PLT because otherwise
+      // .plt.got and .got would refer each other, resulting in an
+      // infinite loop at runtime.
+      ctx.plt->add_symbol(ctx, sym);
+    } else if (sym->flags & NEEDS_PLT) {
+      if (sym->flags & NEEDS_GOT)
+        ctx.pltgot->add_symbol(ctx, sym);
+      else
         ctx.plt->add_symbol(ctx, sym);
-      } else {
-        if (sym->flags & NEEDS_GOT)
-          ctx.pltgot->add_symbol(ctx, sym);
-        else
-          ctx.plt->add_symbol(ctx, sym);
-      }
     }
 
     if (sym->flags & NEEDS_GOTTP)
@@ -997,7 +1002,7 @@ void create_reloc_sections(Context<E> &ctx) {
   for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections) {
     RelocSection<E> *r = new RelocSection<E>(ctx, *osec);
     ctx.chunks.push_back(r);
-    ctx.output_chunks.emplace_back(r);
+    ctx.chunk_pool.emplace_back(r);
   }
 
   // Create a table to map input symbol indices to output symbol indices
@@ -1092,10 +1097,12 @@ void apply_version_script(Context<E> &ctx) {
         continue;
       }
 
-      if (!cpp_matcher.empty())
+      if (!cpp_matcher.empty()) {
         if (std::optional<std::string_view> s = cpp_demangle(name))
-          if (std::optional<u16> ver = cpp_matcher.find(*s))
-            sym->ver_idx = *ver;
+          name = *s;
+        if (std::optional<u16> ver = cpp_matcher.find(name))
+          sym->ver_idx = *ver;
+      }
     }
   });
 }
@@ -1158,18 +1165,23 @@ template <typename E>
 void compute_import_export(Context<E> &ctx) {
   Timer t(ctx, "compute_import_export");
 
-  // Export symbols referenced by DSOs.
+  // If we are creating an executable, we want to export symbols referenced
+  // by DSOs unless they are explicitly marked as local by a version script.
   if (!ctx.arg.shared) {
     tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
       for (Symbol<E> *sym : file->symbols) {
         if (sym->file && !sym->file->is_dso && sym->visibility != STV_HIDDEN) {
-          std::scoped_lock lock(sym->mu);
-          sym->is_exported = true;
+          if (sym->ver_idx != VER_NDX_LOCAL || !ctx.version_specified) {
+            std::scoped_lock lock(sym->mu);
+            sym->is_exported = true;
+          }
         }
       }
     });
   }
 
+  // Export symbols that are not hidden or marked as local.
+  // We also want to mark imported symbols as such.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (Symbol<E> *sym : file->get_global_syms()) {
       if (!sym->file || sym->visibility == STV_HIDDEN ||
@@ -1177,7 +1189,7 @@ void compute_import_export(Context<E> &ctx) {
         continue;
 
       // If we are using a symbol in a DSO, we need to import it at runtime.
-      if (sym->file != file && sym->file->is_dso) {
+      if (sym->file != file && sym->file->is_dso && !sym->is_absolute()) {
         std::scoped_lock lock(sym->mu);
         sym->is_imported = true;
         continue;
@@ -1200,8 +1212,9 @@ void compute_import_export(Context<E> &ctx) {
 template <typename E>
 void mark_addrsig(Context<E> &ctx) {
   Timer t(ctx, "mark_addrsig");
+
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->fill_addrsig(ctx);
+    file->mark_addrsig(ctx);
   });
 }
 
@@ -1267,34 +1280,34 @@ i64 get_section_rank(Context<E> &ctx, Chunk<E> *chunk) {
   u64 type = chunk->shdr.sh_type;
   u64 flags = chunk->shdr.sh_flags;
 
-  if (chunk == ctx.ehdr.get())
+  if (chunk == ctx.ehdr)
     return 0;
-  if (chunk == ctx.phdr.get())
+  if (chunk == ctx.phdr)
     return 1;
-  if (chunk == ctx.interp.get())
+  if (chunk == ctx.interp)
     return 2;
 
   if (type == SHT_NOTE && (flags & SHF_ALLOC))
     return (1 << 10) + chunk->shdr.sh_addralign;
 
-  if (chunk == ctx.hash.get())
+  if (chunk == ctx.hash)
     return (1 << 11) + 0;
-  if (chunk == ctx.gnu_hash.get())
+  if (chunk == ctx.gnu_hash)
     return (1 << 11) + 1;
-  if (chunk == ctx.dynsym.get())
+  if (chunk == ctx.dynsym)
     return (1 << 11) + 2;
-  if (chunk == ctx.dynstr.get())
+  if (chunk == ctx.dynstr)
     return (1 << 11) + 3;
-  if (chunk == ctx.versym.get())
+  if (chunk == ctx.versym)
     return (1 << 11) + 4;
-  if (chunk == ctx.verneed.get())
+  if (chunk == ctx.verneed)
     return (1 << 11) + 5;
-  if (chunk == ctx.reldyn.get())
+  if (chunk == ctx.reldyn)
     return (1 << 11) + 6;
-  if (chunk == ctx.relplt.get())
+  if (chunk == ctx.relplt)
     return (1 << 11) + 7;
 
-  if (chunk == ctx.shdr.get())
+  if (chunk == ctx.shdr)
     return 1 << 30;
   if (!(flags & SHF_ALLOC))
     return (1 << 30) - 1;
@@ -1325,22 +1338,22 @@ i64 do_set_osec_offsets(Context<E> &ctx) {
 
   // Assign virtual addresses
   u64 addr = ctx.arg.image_base;
-  for (i64 i = 0; i < chunks.size(); i++) {
-    if (!(chunks[i]->shdr.sh_flags & SHF_ALLOC))
+  for (Chunk<E> *chunk : chunks) {
+    if (!(chunk->shdr.sh_flags & SHF_ALLOC))
       continue;
 
-    if (auto it = ctx.arg.section_start.find(chunks[i]->name);
+    if (auto it = ctx.arg.section_start.find(chunk->name);
         it != ctx.arg.section_start.end())
       addr = it->second;
 
-    if (is_tbss(chunks[i])) {
-      chunks[i]->shdr.sh_addr = addr;
+    if (is_tbss(chunk)) {
+      chunk->shdr.sh_addr = addr;
       continue;
     }
 
-    addr = align_to(addr, alignment(chunks[i]));
-    chunks[i]->shdr.sh_addr = addr;
-    addr += chunks[i]->shdr.sh_size;
+    addr = align_to(addr, alignment(chunk));
+    chunk->shdr.sh_addr = addr;
+    addr += chunk->shdr.sh_size;
   }
 
   // Fix tbss virtual addresses. tbss sections are laid out as if they
@@ -1374,23 +1387,19 @@ i64 do_set_osec_offsets(Context<E> &ctx) {
 
     fileoff = align_to(fileoff, alignment(&first));
 
-    u64 end = fileoff;
-    while (i < chunks.size() && (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
-           chunks[i]->shdr.sh_type != SHT_NOBITS) {
-      // The addresses may not increase monotonically if a user uses
-      // --start-sections.
-      if (chunks[i]->shdr.sh_addr < first.shdr.sh_addr)
-        break;
-
+    do {
       chunks[i]->shdr.sh_offset =
         fileoff + chunks[i]->shdr.sh_addr - first.shdr.sh_addr;
-      end = chunks[i]->shdr.sh_offset + chunks[i]->shdr.sh_size;
       i++;
-    }
+    } while (i < chunks.size() &&
+             (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
+             chunks[i]->shdr.sh_type != SHT_NOBITS &&
+             first.shdr.sh_addr <= chunks[i]->shdr.sh_addr);
 
-    fileoff = end;
+    fileoff = chunks[i - 1]->shdr.sh_offset + chunks[i - 1]->shdr.sh_size;
 
-    while (i < chunks.size() && (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
+    while (i < chunks.size() &&
+           (chunks[i]->shdr.sh_flags & SHF_ALLOC) &&
            chunks[i]->shdr.sh_type == SHT_NOBITS)
       i++;
   }
@@ -1458,7 +1467,6 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   if (Chunk<E> *chunk = find(".bss"))
     start(ctx.__bss_start, chunk);
 
-  // __ehdr_start, __executable_start and __dso_handle
   if (ctx.ehdr) {
     for (Chunk<E> *chunk : ctx.chunks) {
       if (chunk->shndx == 1) {
@@ -1466,8 +1474,11 @@ void fix_synthetic_symbols(Context<E> &ctx) {
         ctx.__ehdr_start->value = ctx.ehdr->shdr.sh_addr;
         ctx.__executable_start->shndx = -1;
         ctx.__executable_start->value = ctx.ehdr->shdr.sh_addr;
-        ctx.__dso_handle->shndx = -1;
-        ctx.__dso_handle->value = ctx.ehdr->shdr.sh_addr;
+
+        if (ctx.__dso_handle) {
+          ctx.__dso_handle->shndx = -1;
+          ctx.__dso_handle->value = ctx.ehdr->shdr.sh_addr;
+        }
         break;
       }
     }
@@ -1541,7 +1552,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     start(ctx._GLOBAL_OFFSET_TABLE_, ctx.got);
 
   // _TLS_MODULE_BASE_
-  if constexpr (E::supports_tlsdesc) {
+  if (ctx._TLS_MODULE_BASE_) {
     // _TLS_MODULE_BASE_ is used for Local Dynamic model for TLSDESC.
     // I believe GCC and Clang don't create a reference to it, but Intel
     // compiler seems to be using this symbol.
@@ -1552,10 +1563,7 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     // DTPOFF's relaxed value.
     u64 addr;
     if constexpr (std::is_same_v<E, X86_64> || std::is_same_v<E, I386>) {
-      if (ctx.arg.relax && !ctx.arg.shared)
-        addr = ctx.tls_end;
-      else
-        addr = ctx.tls_begin;
+      addr = (ctx.arg.relax && !ctx.arg.shared) ? ctx.tls_end : ctx.tls_begin;
     } else {
       addr = ctx.tls_begin;
     }
@@ -1568,18 +1576,16 @@ void fix_synthetic_symbols(Context<E> &ctx) {
   start(ctx.__GNU_EH_FRAME_HDR, ctx.eh_frame_hdr);
 
   // RISC-V's __global_pointer$
-  if constexpr (std::is_same_v<E, RISCV64>) {
-    if (!ctx.arg.shared) {
-      if (Chunk<E> *chunk = find(".sdata"))
-        ctx.__global_pointer->shndx = -chunk->shndx;
-      else
-        ctx.__global_pointer->shndx = -1;
-      ctx.__global_pointer->value = 0x800;
-    }
+  if (ctx.__global_pointer) {
+    if (Chunk<E> *chunk = find(".sdata"))
+      ctx.__global_pointer->shndx = -chunk->shndx;
+    else
+      ctx.__global_pointer->shndx = -1;
+    ctx.__global_pointer->value = 0x800;
   }
 
   // ARM32's __exidx_{start,end}
-  if constexpr (std::is_same_v<E, ARM32>) {
+  if (ctx.__exidx_start) {
     if (Chunk<E> *chunk = find(".ARM.exidx")) {
       start(ctx.__exidx_start, chunk);
       stop(ctx.__exidx_end, chunk);
@@ -1643,7 +1649,7 @@ i64 compress_debug_sections(Context<E> &ctx) {
       comp = new GnuCompressedSection<E>(ctx, chunk);
     assert(comp);
 
-    ctx.output_chunks.emplace_back(comp);
+    ctx.chunk_pool.emplace_back(comp);
     ctx.chunks[i] = comp;
   });
 
@@ -1686,6 +1692,7 @@ void write_dependency_file(Context<E> &ctx) {
 }
 
 #define INSTANTIATE(E)                                                  \
+  template void create_internal_file(Context<E> &);                     \
   template void apply_exclude_libs(Context<E> &);                       \
   template void create_synthetic_sections(Context<E> &);                \
   template void resolve_symbols(Context<E> &);                          \
@@ -1694,7 +1701,7 @@ void write_dependency_file(Context<E> &ctx) {
   template void convert_common_symbols(Context<E> &);                   \
   template void compute_merged_section_sizes(Context<E> &);             \
   template void bin_sections(Context<E> &);                             \
-  template ObjectFile<E> *create_internal_file(Context<E> &);           \
+  template void add_synthetic_symbols(Context<E> &);                    \
   template void check_cet_errors(Context<E> &);                         \
   template void print_dependencies(Context<E> &);                       \
   template void print_dependencies_full(Context<E> &);                  \
@@ -1713,7 +1720,7 @@ void write_dependency_file(Context<E> &ctx) {
   template void apply_version_script(Context<E> &);                     \
   template void parse_symbol_version(Context<E> &);                     \
   template void compute_import_export(Context<E> &);                    \
-  template void mark_addrsig(Context<E> &);                                   \
+  template void mark_addrsig(Context<E> &);                             \
   template void clear_padding(Context<E> &);                            \
   template i64 get_section_rank(Context<E> &, Chunk<E> *);              \
   template i64 set_osec_offsets(Context<E> &);                          \

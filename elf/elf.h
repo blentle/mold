@@ -23,6 +23,7 @@ struct I386;
 struct ARM64;
 struct ARM32;
 struct RISCV64;
+struct RISCV32;
 
 template <typename E> struct ElfSym;
 template <typename E> struct ElfShdr;
@@ -31,6 +32,21 @@ template <typename E> struct ElfPhdr;
 template <typename E> struct ElfRel;
 template <typename E> struct ElfDyn;
 template <typename E> struct ElfChdr;
+
+enum class MachineType { NONE, X86_64, I386, ARM64, ARM32, RISCV64, RISCV32 };
+
+inline std::ostream &operator<<(std::ostream &out, MachineType mt) {
+  switch (mt) {
+  case MachineType::NONE:    out << "none";    break;
+  case MachineType::X86_64:  out << "x86_64";  break;
+  case MachineType::I386:    out << "i386";    break;
+  case MachineType::ARM64:   out << "arm64";   break;
+  case MachineType::ARM32:   out << "arm32";   break;
+  case MachineType::RISCV64: out << "riscv64"; break;
+  case MachineType::RISCV32: out << "riscv32"; break;
+  }
+  return out;
+}
 
 template <typename E>
 std::string rel_to_string(u32 r_type);
@@ -147,6 +163,7 @@ static constexpr u32 ELFCLASS64 = 2;
 
 static constexpr u32 EV_CURRENT = 1;
 
+static constexpr u32 EM_NONE = 0;
 static constexpr u32 EM_386 = 3;
 static constexpr u32 EM_ARM = 40;
 static constexpr u32 EM_X86_64 = 62;
@@ -967,8 +984,6 @@ static constexpr u32 R_RISCV_SUB8 = 37;
 static constexpr u32 R_RISCV_SUB16 = 38;
 static constexpr u32 R_RISCV_SUB32 = 39;
 static constexpr u32 R_RISCV_SUB64 = 40;
-static constexpr u32 R_RISCV_GNU_VTINHERIT = 41;
-static constexpr u32 R_RISCV_GNU_VTENTRY = 42;
 static constexpr u32 R_RISCV_ALIGN = 43;
 static constexpr u32 R_RISCV_RVC_BRANCH = 44;
 static constexpr u32 R_RISCV_RVC_JUMP = 45;
@@ -1022,8 +1037,6 @@ inline std::string rel_to_string<RISCV64>(u32 r_type) {
   case R_RISCV_SUB16: return "R_RISCV_SUB16";
   case R_RISCV_SUB32: return "R_RISCV_SUB32";
   case R_RISCV_SUB64: return "R_RISCV_SUB64";
-  case R_RISCV_GNU_VTINHERIT: return "R_RISCV_GNU_VTINHERIT";
-  case R_RISCV_GNU_VTENTRY: return "R_RISCV_GNU_VTENTRY";
   case R_RISCV_ALIGN: return "R_RISCV_ALIGN";
   case R_RISCV_RVC_BRANCH: return "R_RISCV_RVC_BRANCH";
   case R_RISCV_RVC_JUMP: return "R_RISCV_RVC_JUMP";
@@ -1038,6 +1051,11 @@ inline std::string rel_to_string<RISCV64>(u32 r_type) {
   case R_RISCV_IRELATIVE: return "R_RISCV_IRELATIVE";
   }
   return "unknown (" + std::to_string(r_type) + ")";
+}
+
+template <>
+inline std::string rel_to_string<RISCV32>(u32 r_type) {
+  return rel_to_string<RISCV64>(r_type);
 }
 
 static constexpr u32 DW_EH_PE_absptr = 0;
@@ -1131,14 +1149,7 @@ struct Elf64Sym {
   bool is_abs() const { return st_shndx == SHN_ABS; }
   bool is_common() const { return st_shndx == SHN_COMMON; }
   bool is_weak() const { return st_bind == STB_WEAK; }
-
-  bool is_undef_strong() const {
-    return st_shndx == SHN_UNDEF && st_bind != STB_WEAK;
-  }
-
-  bool is_undef_weak() const {
-    return st_shndx == SHN_UNDEF && st_bind == STB_WEAK;
-  }
+  bool is_undef_weak() const { return is_undef() && is_weak(); }
 
   ul32 st_name;
   u8 st_type : 4;
@@ -1155,14 +1166,7 @@ struct Elf32Sym {
   bool is_abs() const { return st_shndx == SHN_ABS; }
   bool is_common() const { return st_shndx == SHN_COMMON; }
   bool is_weak() const { return st_bind == STB_WEAK; }
-
-  bool is_undef_strong() const {
-    return st_shndx == SHN_UNDEF && st_bind != STB_WEAK;
-  }
-
-  bool is_undef_weak() const {
-    return st_shndx == SHN_UNDEF && st_bind == STB_WEAK;
-  }
+  bool is_undef_weak() const { return is_undef() && is_weak(); }
 
   ul32 st_name;
   ul32 st_value;
@@ -1255,19 +1259,46 @@ struct Elf32Phdr {
   ul32 p_align;
 };
 
+// Depending on the target, ElfRel may or may not contain r_addend member.
+// The relocation record containing r_addend is called RELA, and that
+// without r_addend is called REL.
+//
+// If REL, relocation addends are stored as parts of section contents.
+// That means we add a computed value to an existing value when writing a
+// relocated value if REL. If RELA, we just overwrite an existing value
+// with a newly computed value.
+//
+// We don't want to have too many `if (REL)`s and `if (RELA)`s in our
+// codebase, so we write dynamic relocations in the following manner:
+//
+// - We always create a dynamic relocation with an addend. If it's REL,
+//   the addend will be discarded.
+//
+// - We also always write an addend to the relocated place even though
+//   it's redundant for RELA. If RELA, the written value will be
+//   ovewritten by the dynamic linker at load-time.
 struct Elf64Rel {
+  Elf64Rel(u64 r_offset, u32 r_type, u32 r_sym, i64 r_addend = 0)
+    : r_offset(r_offset), r_type(r_type), r_sym(r_sym) {}
+
   ul64 r_offset;
   ul32 r_type;
   ul32 r_sym;
 };
 
 struct Elf32Rel {
+  Elf32Rel(u64 r_offset, u32 r_type, u32 r_sym, i64 r_addend = 0)
+    : r_offset(r_offset), r_type(r_type), r_sym(r_sym) {}
+
   ul32 r_offset;
   u8 r_type;
   ul24 r_sym;
 };
 
 struct Elf64Rela {
+  Elf64Rela(u64 r_offset, u32 r_type, u32 r_sym, i64 r_addend)
+    : r_offset(r_offset), r_type(r_type), r_sym(r_sym), r_addend(r_addend) {}
+
   ul64 r_offset;
   ul32 r_type;
   ul32 r_sym;
@@ -1275,6 +1306,9 @@ struct Elf64Rela {
 };
 
 struct Elf32Rela {
+  Elf32Rela(u64 r_offset, u32 r_type, u32 r_sym, i64 r_addend)
+    : r_offset(r_offset), r_type(r_type), r_sym(r_sym), r_addend(r_addend) {}
+
   ul32 r_offset;
   u8 r_type;
   ul24 r_sym;
@@ -1341,8 +1375,17 @@ struct ElfNhdr {
   ul32 n_type;
 };
 
+template <typename E>
+inline constexpr bool is_rela = requires(ElfRel<E> r) { r.r_addend; };
+
+template <typename E>
+inline constexpr bool supports_tlsdesc = requires { E::R_TLSDESC; };
+
+template <typename E>
+using Word = typename E::Word;
+
 struct X86_64 {
-  using WordTy = ul64;
+  using Word = ul64;
 
   static constexpr u32 R_NONE = R_X86_64_NONE;
   static constexpr u32 R_COPY = R_X86_64_COPY;
@@ -1356,26 +1399,24 @@ struct X86_64 {
   static constexpr u32 R_DTPMOD = R_X86_64_DTPMOD64;
   static constexpr u32 R_TLSDESC = R_X86_64_TLSDESC;
 
-  static constexpr u32 word_size = 8;
+  static constexpr MachineType machine_type = MachineType::X86_64;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_X86_64;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr bool is_rel = false;
-  static constexpr bool supports_tlsdesc = true;
 };
 
 template <> struct ElfSym<X86_64> : public Elf64Sym {};
 template <> struct ElfShdr<X86_64> : public Elf64Shdr {};
 template <> struct ElfEhdr<X86_64> : public Elf64Ehdr {};
 template <> struct ElfPhdr<X86_64> : public Elf64Phdr {};
-template <> struct ElfRel<X86_64> : public Elf64Rela {};
+template <> struct ElfRel<X86_64> : public Elf64Rela { using Elf64Rela::Elf64Rela; };
 template <> struct ElfDyn<X86_64> : public Elf64Dyn {};
 template <> struct ElfChdr<X86_64> : public Elf64Chdr {};
 
 struct I386 {
-  using WordTy = ul32;
+  using Word = ul32;
 
   static constexpr u32 R_NONE = R_386_NONE;
   static constexpr u32 R_COPY = R_386_COPY;
@@ -1389,26 +1430,24 @@ struct I386 {
   static constexpr u32 R_DTPMOD = R_386_TLS_DTPMOD32;
   static constexpr u32 R_TLSDESC = R_386_TLS_DESC;
 
-  static constexpr u32 word_size = 4;
+  static constexpr MachineType machine_type = MachineType::I386;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_386;
   static constexpr u32 plt_hdr_size = 16;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 8;
-  static constexpr bool is_rel = true;
-  static constexpr bool supports_tlsdesc = true;
 };
 
 template <> struct ElfSym<I386> : public Elf32Sym {};
 template <> struct ElfShdr<I386> : public Elf32Shdr {};
 template <> struct ElfEhdr<I386> : public Elf32Ehdr {};
 template <> struct ElfPhdr<I386> : public Elf32Phdr {};
-template <> struct ElfRel<I386> : public Elf32Rel {};
+template <> struct ElfRel<I386> : public Elf32Rel { using Elf32Rel::Elf32Rel; };
 template <> struct ElfDyn<I386> : public Elf32Dyn {};
 template <> struct ElfChdr<I386> : public Elf32Chdr {};
 
 struct ARM64 {
-  using WordTy = ul64;
+  using Word = ul64;
 
   static constexpr u32 R_NONE = R_AARCH64_NONE;
   static constexpr u32 R_COPY = R_AARCH64_COPY;
@@ -1422,26 +1461,25 @@ struct ARM64 {
   static constexpr u32 R_DTPMOD = R_AARCH64_TLS_DTPMOD64;
   static constexpr u32 R_TLSDESC = R_AARCH64_TLSDESC;
 
-  static constexpr u32 word_size = 8;
+  static constexpr MachineType machine_type = MachineType::ARM64;
   static constexpr u32 page_size = 65536;
   static constexpr u32 e_machine = EM_AARCH64;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr bool is_rel = false;
-  static constexpr bool supports_tlsdesc = true;
+  static constexpr u32 tls_offset = 16;
 };
 
 template <> struct ElfSym<ARM64> : public Elf64Sym {};
 template <> struct ElfShdr<ARM64> : public Elf64Shdr {};
 template <> struct ElfEhdr<ARM64> : public Elf64Ehdr {};
 template <> struct ElfPhdr<ARM64> : public Elf64Phdr {};
-template <> struct ElfRel<ARM64> : public Elf64Rela {};
+template <> struct ElfRel<ARM64> : public Elf64Rela { using Elf64Rela::Elf64Rela; };
 template <> struct ElfDyn<ARM64> : public Elf64Dyn {};
 template <> struct ElfChdr<ARM64> : public Elf64Chdr {};
 
 struct ARM32 {
-  using WordTy = ul32;
+  using Word = ul32;
 
   static constexpr u32 R_NONE = R_ARM_NONE;
   static constexpr u32 R_COPY = R_ARM_COPY;
@@ -1455,26 +1493,25 @@ struct ARM32 {
   static constexpr u32 R_DTPMOD = R_ARM_TLS_DTPMOD32;
   static constexpr u32 R_TLSDESC = R_ARM_TLS_DESC;
 
-  static constexpr u32 word_size = 4;
+  static constexpr MachineType machine_type = MachineType::ARM32;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_ARM;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr bool is_rel = true;
-  static constexpr bool supports_tlsdesc = true;
+  static constexpr u32 tls_offset = 8;
 };
 
 template <> struct ElfSym<ARM32> : public Elf32Sym {};
 template <> struct ElfShdr<ARM32> : public Elf32Shdr {};
 template <> struct ElfEhdr<ARM32> : public Elf32Ehdr {};
 template <> struct ElfPhdr<ARM32> : public Elf32Phdr {};
-template <> struct ElfRel<ARM32> : public Elf32Rel {};
+template <> struct ElfRel<ARM32> : public Elf32Rel { using Elf32Rel::Elf32Rel; };
 template <> struct ElfDyn<ARM32> : public Elf32Dyn {};
 template <> struct ElfChdr<ARM32> : public Elf32Chdr {};
 
 struct RISCV64 {
-  using WordTy = ul64;
+  using Word = ul64;
 
   static constexpr u32 R_NONE = R_RISCV_NONE;
   static constexpr u32 R_COPY = R_RISCV_COPY;
@@ -1487,22 +1524,52 @@ struct RISCV64 {
   static constexpr u32 R_TPOFF = R_RISCV_TLS_TPREL64;
   static constexpr u32 R_DTPMOD = R_RISCV_TLS_DTPMOD64;
 
-  static constexpr u32 word_size = 8;
+  static constexpr MachineType machine_type = MachineType::RISCV64;
   static constexpr u32 page_size = 4096;
   static constexpr u32 e_machine = EM_RISCV;
   static constexpr u32 plt_hdr_size = 32;
   static constexpr u32 plt_size = 16;
   static constexpr u32 pltgot_size = 16;
-  static constexpr bool is_rel = false;
-  static constexpr bool supports_tlsdesc = false;
+  static constexpr u32 tls_offset = 0;
 };
 
 template <> struct ElfSym<RISCV64> : public Elf64Sym {};
 template <> struct ElfShdr<RISCV64> : public Elf64Shdr {};
 template <> struct ElfEhdr<RISCV64> : public Elf64Ehdr {};
 template <> struct ElfPhdr<RISCV64> : public Elf64Phdr {};
-template <> struct ElfRel<RISCV64> : public Elf64Rela {};
+template <> struct ElfRel<RISCV64> : public Elf64Rela { using Elf64Rela::Elf64Rela; };
 template <> struct ElfDyn<RISCV64> : public Elf64Dyn {};
 template <> struct ElfChdr<RISCV64> : public Elf64Chdr {};
+
+struct RISCV32 {
+  using Word = ul32;
+
+  static constexpr u32 R_NONE = R_RISCV_NONE;
+  static constexpr u32 R_COPY = R_RISCV_COPY;
+  static constexpr u32 R_GLOB_DAT = R_RISCV_32;
+  static constexpr u32 R_JUMP_SLOT = R_RISCV_JUMP_SLOT;
+  static constexpr u32 R_ABS = R_RISCV_32;
+  static constexpr u32 R_RELATIVE = R_RISCV_RELATIVE;
+  static constexpr u32 R_IRELATIVE = R_RISCV_IRELATIVE;
+  static constexpr u32 R_DTPOFF = R_RISCV_TLS_DTPREL32;
+  static constexpr u32 R_TPOFF = R_RISCV_TLS_TPREL32;
+  static constexpr u32 R_DTPMOD = R_RISCV_TLS_DTPMOD32;
+
+  static constexpr MachineType machine_type = MachineType::RISCV32;
+  static constexpr u32 page_size = 4096;
+  static constexpr u32 e_machine = EM_RISCV;
+  static constexpr u32 plt_hdr_size = 32;
+  static constexpr u32 plt_size = 16;
+  static constexpr u32 pltgot_size = 16;
+  static constexpr u32 tls_offset = 0;
+};
+
+template <> struct ElfSym<RISCV32> : public Elf32Sym {};
+template <> struct ElfShdr<RISCV32> : public Elf32Shdr {};
+template <> struct ElfEhdr<RISCV32> : public Elf32Ehdr {};
+template <> struct ElfPhdr<RISCV32> : public Elf32Phdr {};
+template <> struct ElfRel<RISCV32> : public Elf32Rela { using Elf32Rela::Elf32Rela; };
+template <> struct ElfDyn<RISCV32> : public Elf32Dyn {};
+template <> struct ElfChdr<RISCV32> : public Elf32Chdr {};
 
 } // namespace mold::elf

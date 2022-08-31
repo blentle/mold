@@ -2,11 +2,14 @@
 #include "../sha.h"
 
 #include <shared_mutex>
-#include <sys/mman.h>
 #include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_for_each.h>
 #include <tbb/parallel_sort.h>
+
+#ifndef _WIN32
+# include <sys/mman.h>
+#endif
 
 namespace mold::macho {
 
@@ -191,8 +194,8 @@ static std::vector<u8> create_function_starts_cmd(Context<E> &ctx) {
 
   cmd.cmd = LC_FUNCTION_STARTS;
   cmd.cmdsize = buf.size();
-  cmd.dataoff = ctx.function_starts.hdr.offset;
-  cmd.datasize = ctx.function_starts.hdr.size;
+  cmd.dataoff = ctx.function_starts->hdr.offset;
+  cmd.datasize = ctx.function_starts->hdr.size;
   return buf;
 }
 
@@ -275,7 +278,8 @@ static std::vector<std::vector<u8>> create_load_commands(Context<E> &ctx) {
     vec.push_back(create_uuid_cmd(ctx));
   vec.push_back(create_build_version_cmd(ctx));
   vec.push_back(create_source_version_cmd(ctx));
-  vec.push_back(create_function_starts_cmd(ctx));
+  if (ctx.arg.function_starts)
+    vec.push_back(create_function_starts_cmd(ctx));
 
   for (DylibFile<E> *file : ctx.dylibs)
     if (file->dylib_idx != BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE)
@@ -643,7 +647,7 @@ void RebaseSection<E>::compute_size(Context<E> &ctx) {
 
   for (i64 i = 0; i < ctx.stubs.syms.size(); i++)
     enc.add(ctx.data_seg->seg_idx,
-            ctx.lazy_symbol_ptr.hdr.addr + i * E::word_size -
+            ctx.lazy_symbol_ptr.hdr.addr + i * word_size -
             ctx.data_seg->cmd.vmaddr);
 
   for (Symbol<E> *sym : ctx.got.syms)
@@ -667,7 +671,7 @@ void RebaseSection<E>::compute_size(Context<E> &ctx) {
 
   for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
     for (Chunk<E> *chunk : seg->chunks)
-      if (chunk->is_output_section && !chunk->hdr.match("__TEXT", "__eh_frame"))
+      if (chunk->is_output_section)
         for (Subsection<E> *subsec : ((OutputSection<E> *)chunk)->members)
           for (Relocation<E> &rel : subsec->get_rels())
             if (!rel.is_pcrel && !rel.is_subtracted && rel.type == E::abs_rel &&
@@ -697,7 +701,7 @@ static i32 get_dylib_idx(InputFile<E> *file) {
 }
 
 template <typename E>
-void BindEncoder::add(Symbol<E> &sym, i64 seg_idx, i64 offset) {
+void BindEncoder::add(Symbol<E> &sym, i64 seg_idx, i64 offset, i64 addend) {
   i64 dylib_idx = get_dylib_idx(sym.file);
   i64 flags = (sym.is_weak ? BIND_SYMBOL_FLAGS_WEAK_IMPORT : 0);
 
@@ -721,10 +725,15 @@ void BindEncoder::add(Symbol<E> &sym, i64 seg_idx, i64 offset) {
     buf.push_back('\0');
   }
 
-  if (last_seg != seg_idx || last_off != offset) {
+  if (last_seg != seg_idx || last_offset != offset) {
     assert(seg_idx < 16);
     buf.push_back(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | seg_idx);
     encode_uleb(buf, offset);
+  }
+
+  if (last_addend != addend) {
+    buf.push_back(BIND_OPCODE_SET_ADDEND_SLEB);
+    encode_sleb(buf, addend);
   }
 
   buf.push_back(BIND_OPCODE_DO_BIND);
@@ -733,7 +742,8 @@ void BindEncoder::add(Symbol<E> &sym, i64 seg_idx, i64 offset) {
   last_name = sym.name;
   last_flags = flags;
   last_seg = seg_idx;
-  last_off = offset;
+  last_offset = offset;
+  last_addend = addend;
 }
 
 void BindEncoder::finish() {
@@ -748,12 +758,12 @@ void BindSection<E>::compute_size(Context<E> &ctx) {
   for (Symbol<E> *sym : ctx.got.syms)
     if (sym->is_imported)
       enc.add(*sym, ctx.data_const_seg->seg_idx,
-              sym->get_got_addr(ctx) - ctx.data_const_seg->cmd.vmaddr);
+              sym->get_got_addr(ctx) - ctx.data_const_seg->cmd.vmaddr, 0);
 
   for (Symbol<E> *sym : ctx.thread_ptrs.syms)
     if (sym->is_imported)
       enc.add(*sym, ctx.data_seg->seg_idx,
-              sym->get_tlv_addr(ctx) - ctx.data_seg->cmd.vmaddr);
+              sym->get_tlv_addr(ctx) - ctx.data_seg->cmd.vmaddr, 0);
 
   for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
     for (Chunk<E> *chunk : seg->chunks)
@@ -762,7 +772,8 @@ void BindSection<E>::compute_size(Context<E> &ctx) {
           for (Relocation<E> &r : subsec->get_rels())
             if (r.needs_dynrel)
               enc.add(*r.sym, seg->seg_idx,
-                      subsec->get_addr(ctx) + r.offset - seg->cmd.vmaddr);
+                      subsec->get_addr(ctx) + r.offset - seg->cmd.vmaddr,
+                      r.addend);
 
   enc.finish();
   contents = std::move(enc.buf);
@@ -802,7 +813,7 @@ void LazyBindSection<E>::add(Context<E> &ctx, Symbol<E> &sym) {
   i64 seg_idx = ctx.data_seg->seg_idx;
   emit(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | seg_idx);
 
-  i64 offset = ctx.lazy_symbol_ptr.hdr.addr + sym.stub_idx * E::word_size -
+  i64 offset = ctx.lazy_symbol_ptr.hdr.addr + sym.stub_idx * word_size -
                ctx.data_seg->cmd.vmaddr;
   encode_uleb(contents, offset);
 
@@ -971,6 +982,9 @@ void ExportSection<E>::copy_buf(Context<E> &ctx) {
   enc.write_trie(buf, enc.root);
 }
 
+// LC_FUNCTION_STARTS contains function start addresses encoded in
+// ULEB128. I don't know what tools consume this table, but we create
+// it anyway by default for the sake of compatibility.
 template <typename E>
 void FunctionStartsSection<E>::compute_size(Context<E> &ctx) {
   std::vector<std::vector<u64>> vec(ctx.objs.size());
@@ -1233,17 +1247,17 @@ void ObjcImageInfoSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void CodeSignatureSection<E>::compute_size(Context<E> &ctx) {
-  std::string filename = filepath(ctx.arg.final_output).filename();
+  std::string filename = filepath(ctx.arg.final_output).filename().string();
   i64 filename_size = align_to(filename.size() + 1, 16);
-  i64 num_blocks = align_to(this->hdr.offset, BLOCK_SIZE) / BLOCK_SIZE;
+  i64 num_blocks = align_to(this->hdr.offset, E::page_size) / E::page_size;
   this->hdr.size = sizeof(CodeSignatureHeader) + sizeof(CodeSignatureBlobIndex) +
                    sizeof(CodeSignatureDirectory) + filename_size +
                    num_blocks * SHA256_SIZE;
 }
 
 // A __code_signature section is optional for x86 macOS but mandatory
-// for ARM macOS. The section contains a cryptographic hash for each 4
-// KiB block of an executable or a dylib file. The program loader
+// for ARM macOS. The section contains a cryptographic hash for each
+// memory page of an executable or a dylib file. The program loader
 // verifies the hash values on the initial execution of a binary and
 // will reject it if a hash value does not match.
 template <typename E>
@@ -1253,9 +1267,9 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
   u8 *buf = ctx.buf + this->hdr.offset;
   memset(buf, 0, this->hdr.size);
 
-  std::string filename = filepath(ctx.arg.final_output).filename();
+  std::string filename = filepath(ctx.arg.final_output).filename().string();
   i64 filename_size = align_to(filename.size() + 1, 16);
-  i64 num_blocks = align_to(this->hdr.offset, BLOCK_SIZE) / BLOCK_SIZE;
+  i64 num_blocks = align_to(this->hdr.offset, E::page_size) / E::page_size;
 
   // Fill code-sign header fields
   CodeSignatureHeader &sighdr = *(CodeSignatureHeader *)buf;
@@ -1284,7 +1298,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
   dir.code_limit = this->hdr.offset;
   dir.hash_size = SHA256_SIZE;
   dir.hash_type = CS_HASHTYPE_SHA256;
-  dir.page_size = std::countr_zero<u64>(BLOCK_SIZE);
+  dir.page_size = std::countr_zero(E::page_size);
   dir.exec_seg_base = ctx.text_seg->cmd.fileoff;
   dir.exec_seg_limit = ctx.text_seg->cmd.filesize;
   if (ctx.output_type == MH_EXECUTE)
@@ -1293,13 +1307,11 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
   memcpy(buf, filename.data(), filename.size());
   buf += filename_size;
 
-  // Compute a hash value for each 4 KiB block. The block size must be
-  // 4 KiB, as the macOS kernel supports only that block size for the
-  // ad-hoc code signatures.
+  // Compute a hash value for each block.
   auto compute_hash = [&](i64 i) {
-    u8 *start = ctx.buf + i * BLOCK_SIZE;
-    u8 *end = ctx.buf + std::min<i64>((i + 1) * BLOCK_SIZE, this->hdr.offset);
-    SHA256(start, end - start, buf + i * SHA256_SIZE);
+    u8 *start = ctx.buf + i * E::page_size;
+    u8 *end = ctx.buf + std::min<i64>((i + 1) * E::page_size, this->hdr.offset);
+    sha256_hash(start, end - start, buf + i * SHA256_SIZE);
   };
 
   for (i64 i = 0; i < num_blocks; i += 1024) {
@@ -1309,7 +1321,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
 #if __APPLE__
     // Calling msync() with MS_ASYNC speeds up the following msync()
     // with MS_INVALIDATE.
-    msync(ctx.buf + i * BLOCK_SIZE, 1024 * BLOCK_SIZE, MS_ASYNC);
+    msync(ctx.buf + i * E::page_size, 1024 * E::page_size, MS_ASYNC);
 #endif
   }
 
@@ -1317,7 +1329,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
   // entire file. We compute its value as a tree hash.
   if (ctx.arg.uuid == UUID_HASH) {
     u8 uuid[SHA256_SIZE];
-    SHA256(ctx.buf + this->hdr.offset, this->hdr.size, uuid);
+    sha256_hash(ctx.buf + this->hdr.offset, this->hdr.size, uuid);
 
     // Indicate that this is UUIDv4 as defined by RFC4122.
     uuid[6] = (uuid[6] & 0b00001111) | 0b01010000;
@@ -1329,7 +1341,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
     // recompute code signatures for the updated blocks.
     ctx.mach_hdr.copy_buf(ctx);
 
-    for (i64 i = 0; i * BLOCK_SIZE < ctx.mach_hdr.hdr.size; i++)
+    for (i64 i = 0; i * E::page_size < ctx.mach_hdr.hdr.size; i++)
       compute_hash(i);
   }
 
@@ -1393,7 +1405,7 @@ void StubsSection<E>::add(Context<E> &ctx, Symbol<E> *sym) {
 
   ctx.stub_helper.hdr.size =
     E::stub_helper_hdr_size + nsyms * E::stub_helper_size;
-  ctx.lazy_symbol_ptr.hdr.size = nsyms * E::word_size;
+  ctx.lazy_symbol_ptr.hdr.size = nsyms * word_size;
 }
 
 template <typename E>
@@ -1572,7 +1584,7 @@ void GotSection<E>::add(Context<E> &ctx, Symbol<E> *sym) {
   assert(sym->got_idx == -1);
   sym->got_idx = syms.size();
   syms.push_back(sym);
-  this->hdr.size = (syms.size() + subsections.size()) * E::word_size;
+  this->hdr.size = (syms.size() + subsections.size()) * word_size;
 }
 
 template <typename E>
@@ -1601,7 +1613,7 @@ void ThreadPtrsSection<E>::add(Context<E> &ctx, Symbol<E> *sym) {
   assert(sym->tlv_idx == -1);
   sym->tlv_idx = syms.size();
   syms.push_back(sym);
-  this->hdr.size = syms.size() * E::word_size;
+  this->hdr.size = syms.size() * word_size;
 }
 
 template <typename E>

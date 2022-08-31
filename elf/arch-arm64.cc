@@ -154,16 +154,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
     switch (rel.r_type) {
     case R_AARCH64_ABS64:
-      if (sym.is_absolute() || !ctx.arg.pic) {
-        *(ul64 *)loc = S + A;
-      } else if (sym.is_imported) {
-        *dynrel++ = {P, R_AARCH64_ABS64, (u32)sym.get_dynsym_idx(ctx), A};
-        *(ul64 *)loc = A;
-      } else {
-        if (!is_relr_reloc(ctx, rel))
-          *dynrel++ = {P, R_AARCH64_RELATIVE, 0, (i64)(S + A)};
-        *(ul64 *)loc = S + A;
-      }
+      apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
       continue;
     case R_AARCH64_LDST8_ABS_LO12_NC:
       *(ul32 *)loc |= bits(S + A, 11, 0) << 10;
@@ -279,14 +270,14 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc |= bits(sym.get_gottp_addr(ctx) + A, 11, 3) << 10;
       continue;
     case R_AARCH64_TLSLE_ADD_TPREL_HI12: {
-      i64 val = S + A - ctx.tls_begin + 16;
+      i64 val = S + A - ctx.tls_begin + E::tls_offset;
       overflow_check(val, 0, (i64)1 << 24);
       *(ul32 *)loc |= bits(val, 23, 12) << 10;
       continue;
     }
     case R_AARCH64_TLSLE_ADD_TPREL_LO12:
     case R_AARCH64_TLSLE_ADD_TPREL_LO12_NC:
-      *(ul32 *)loc |= bits(S + A - ctx.tls_begin + 16, 11, 0) << 10;
+      *(ul32 *)loc |= bits(S + A - ctx.tls_begin + E::tls_offset, 11, 0) << 10;
       continue;
     case R_AARCH64_TLSGD_ADR_PAGE21: {
       i64 val = page(sym.get_tlsgd_addr(ctx) + A) - page(P);
@@ -300,7 +291,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_AARCH64_TLSDESC_ADR_PAGE21: {
       if (ctx.relax_tlsdesc && !sym.is_imported) {
         // adrp x0, 0 -> movz x0, #tls_ofset_hi, lsl #16
-        i64 val = (S + A - ctx.tls_begin + 16);
+        i64 val = (S + A - ctx.tls_begin + E::tls_offset);
         overflow_check(val, -((i64)1 << 32), (i64)1 << 32);
         *(ul32 *)loc = 0xd2a00000 | (bits(val, 32, 16) << 5);
       } else {
@@ -313,7 +304,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_AARCH64_TLSDESC_LD64_LO12:
       if (ctx.relax_tlsdesc && !sym.is_imported) {
         // ldr x2, [x0] -> movk x0, #tls_ofset_lo
-        u32 offset_lo = (S + A - ctx.tls_begin + 16) & 0xffff;
+        u32 offset_lo = (S + A - ctx.tls_begin + E::tls_offset) & 0xffff;
         *(ul32 *)loc = 0xf2800000 | (offset_lo << 5);
       } else {
         *(ul32 *)loc |= bits(sym.get_tlsdesc_addr(ctx) + A, 11, 3) << 10;
@@ -413,22 +404,13 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC) {
-      sym.flags |= NEEDS_GOT;
-      sym.flags |= NEEDS_PLT;
-    }
+    if (sym.get_type() == STT_GNU_IFUNC)
+      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
 
     switch (rel.r_type) {
-    case R_AARCH64_ABS64: {
-      Action table[][4] = {
-        // Absolute  Local    Imported data  Imported code
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       CPLT   },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_AARCH64_ABS64:
+      scan_abs_dyn_rel(ctx, sym, rel);
       break;
-    }
     case R_AARCH64_ADR_GOT_PAGE:
     case R_AARCH64_LD64_GOT_LO12_NC:
     case R_AARCH64_LD64_GOTPAGE_LO15:
@@ -443,16 +425,9 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC:
       sym.flags |= NEEDS_GOTTP;
       break;
-    case R_AARCH64_ADR_PREL_PG_HI21: {
-      Action table[][4] = {
-        // Absolute  Local    Imported data  Imported code
-        {  ERROR,    NONE,    ERROR,         ERROR },      // DSO
-        {  ERROR,    NONE,    COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,    COPYREL,       CPLT  },      // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_AARCH64_ADR_PREL_PG_HI21:
+      scan_pcrel_rel(ctx, sym, rel);
       break;
-    }
     case R_AARCH64_TLSGD_ADR_PAGE21:
       sym.flags |= NEEDS_TLSGD;
       break;
@@ -497,7 +472,7 @@ static void reset_thunk(RangeExtensionThunk<E> &thunk) {
   for (Symbol<E> *sym : thunk.symbols) {
     sym->extra.thunk_idx = -1;
     sym->extra.thunk_sym_idx = -1;
-    sym->flags &= (u8)~NEEDS_RANGE_EXTN_THUNK;
+    sym->flags = 0;
   }
 }
 

@@ -156,15 +156,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     switch (rel.r_type) {
     case R_ARM_ABS32:
     case R_ARM_TARGET1:
-      if (sym.is_absolute() || !ctx.arg.pic) {
-        *(ul32 *)loc = S + A;
-      } else if (sym.is_imported) {
-        *dynrel++ = {P, R_ARM_ABS32, (u32)sym.get_dynsym_idx(ctx)};
-      } else {
-        if (!is_relr_reloc(ctx, rel))
-          *dynrel++ = {P, R_ARM_RELATIVE, 0};
-        *(ul32 *)loc = S + A;
-      }
+      apply_abs_dyn_rel(ctx, sym, rel, loc, S, A, P, dynrel);
       continue;
     case R_ARM_REL32:
       *(ul32 *)loc = S + A - P;
@@ -177,48 +169,55 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
         // On ARM, calling an weak undefined symbol jumps to the
         // next instruction.
         write_thm_b_imm(loc, 4);
-        *(ul16 *)(loc + 2) |= (1 << 12); // rewrite with BL
+        *(ul16 *)(loc + 2) |= 0x1000;  // rewrite with BL
       } else if (T) {
         write_thm_b_imm(loc, S + A - P);
-        *(ul16 *)(loc + 2) |= (1 << 12); // rewrite with BL
+        *(ul16 *)(loc + 2) |= 0x1000;  // rewrite with BL
       } else {
         write_thm_b_imm(loc, align_to(S + A - P, 4));
-        *(ul16 *)(loc + 2) &= ~(1 << 12); // rewrite with BLX
+        *(ul16 *)(loc + 2) &= ~0x1000; // rewrite with BLX
       }
       continue;
     case R_ARM_BASE_PREL:
       *(ul32 *)loc = GOT + A - P;
       continue;
     case R_ARM_GOT_PREL:
-      *(ul32 *)loc = G + A - P;
+    case R_ARM_TARGET2:
+      *(ul32 *)loc = GOT + G + A - P;
       continue;
     case R_ARM_GOT_BREL:
       *(ul32 *)loc = G + A;
       continue;
-    case R_ARM_TARGET2:
-      *(ul32 *)loc = GOT + G + A - P;
-      continue;
-    case R_ARM_CALL:
-    case R_ARM_JUMP24: {
-      u32 val;
+    case R_ARM_CALL: {
+      // Just like THM_CALL, ARM_CALL relocation refers either BL or
+      // BLX instruction. We may need to rewrite BL → BLX or BLX → BL.
+      bool is_bl = ((*(ul32 *)loc & 0xff00'0000) == 0xeb00'0000);
+      bool is_blx = ((*(ul32 *)loc & 0xfe00'0000) == 0xfa00'0000);
+      if (!is_bl && !is_blx)
+        Fatal(ctx) << *this << ": R_ARM_CALL refers neither BL nor BLX";
 
       if (sym.esym().is_undef_weak()) {
         // On ARM, calling an weak undefined symbol jumps to the
         // next instruction.
-        val = 4;
+        *(ul32 *)loc = 0xeb00'0001;
+      } else if (T) {
+        u32 val = S + A - P;
+        *(ul32 *)loc = 0xfa00'0000 | (bit(val, 1) << 24) | bits(val, 25, 2);
       } else {
-        val = S + A - P;
+        *(ul32 *)loc = 0xeb00'0000 | bits(S + A - P, 25, 2);
       }
-
-      *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | ((val >> 2) & 0x00ff'ffff);
       continue;
     }
-    case R_ARM_THM_JUMP11: {
+    case R_ARM_JUMP24:
+      if (sym.esym().is_undef_weak())
+        *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | 1;
+      else
+        *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | bits(S + A - P, 25, 2);
+      continue;
+    case R_ARM_THM_JUMP11:
       assert(T);
-      u32 val = (S + A - P) >> 1;
-      *(ul16 *)loc = (*(ul16 *)loc & 0xf800) | (val & 0x07ff);
+      *(ul16 *)loc = (*(ul16 *)loc & 0xf800) | bits(S + A - P, 11, 1);
       continue;
-    }
     case R_ARM_THM_JUMP24:
       if (T) {
         write_thm_b_imm(loc, S + A - P);
@@ -239,11 +238,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_ARM_THM_MOVW_PREL_NC:
       write_thm_mov_imm(loc, ((S + A) | T) - P);
       continue;
-    case R_ARM_PREL31: {
-      u32 val = S + A - P;
-      *(ul32 *)loc = (*(ul32 *)loc & 0x8000'0000) | (val & 0x7fff'ffff);
+    case R_ARM_PREL31:
+      *(ul32 *)loc = (*(ul32 *)loc & 0x8000'0000) | ((S + A - P) & 0x7fff'ffff);
       continue;
-    }
     case R_ARM_THM_MOVW_ABS_NC:
       write_thm_mov_imm(loc, (S + A) | T);
       continue;
@@ -272,22 +269,22 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = sym.get_gottp_addr(ctx) + A - P;
       continue;
     case R_ARM_TLS_LE32:
-      *(ul32 *)loc = S + A - ctx.tls_begin + 8;
+      *(ul32 *)loc = S + A - ctx.tls_begin + E::tls_offset;
       continue;
     case R_ARM_TLS_GOTDESC:
       if (sym.get_tlsdesc_idx(ctx) == -1)
-        *(ul32 *)loc = S - ctx.tls_begin + 8;
+        *(ul32 *)loc = S - ctx.tls_begin + E::tls_offset;
       else
         *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) + A - P - 6;
       continue;
     case R_ARM_THM_TLS_CALL:
       if (sym.get_tlsdesc_idx(ctx) == -1) {
         // BL -> NOP
-        *(ul32 *)loc = 0x8000f3af;
+        *(ul32 *)loc = 0x8000'f3af;
       } else {
         u64 addr = ctx.tls_trampoline->shdr.sh_addr;
         write_thm_b_imm(loc, align_to(addr - P - 4, 4));
-        *(ul16 *)(loc + 2) &= ~(1 << 12); // rewrite BL with BLX
+        *(ul16 *)(loc + 2) &= ~0x1000; // rewrite BL with BLX
       }
       continue;
     default:
@@ -374,66 +371,38 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC) {
-      sym.flags |= NEEDS_GOT;
-      sym.flags |= NEEDS_PLT;
-    }
+    if (sym.get_type() == STT_GNU_IFUNC)
+      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
 
     switch (rel.r_type) {
     case R_ARM_ABS32:
     case R_ARM_MOVT_ABS:
     case R_ARM_THM_MOVT_ABS:
-    case R_ARM_TARGET1: {
-      Action table[][4] = {
-        // Absolute  Local    Imported data  Imported code
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       CPLT   },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_ARM_TARGET1:
+      scan_abs_dyn_rel(ctx, sym, rel);
       break;
-    }
-    case R_ARM_REL32:
-    case R_ARM_BASE_PREL:
-      break;
-    case R_ARM_THM_CALL: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  NONE,     NONE,  PLT,           PLT    },     // DSO
-        {  NONE,     NONE,  PLT,           PLT    },     // PIE
-        {  NONE,     NONE,  PLT,           PLT    },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
-      break;
-    }
-    case R_ARM_GOT_PREL:
-    case R_ARM_GOT_BREL:
-    case R_ARM_TARGET2:
-      sym.flags |= NEEDS_GOT;
-      break;
+    case R_ARM_THM_CALL:
     case R_ARM_CALL:
     case R_ARM_JUMP24:
       if (sym.is_imported)
         sym.flags |= NEEDS_PLT;
       break;
+    case R_ARM_GOT_PREL:
+    case R_ARM_GOT_BREL:
+    case R_ARM_TARGET2:
+      sym.flags |= NEEDS_GOT;
+      break;
     case R_ARM_THM_JUMP24:
       if (sym.is_imported || sym.get_type() == STT_GNU_IFUNC)
-        sym.flags |= NEEDS_PLT | NEEDS_THUMB_TO_ARM_THUNK;
+        sym.flags |= (NEEDS_PLT | NEEDS_THUMB_TO_ARM_THUNK);
       else if (sym.esym().st_value % 2 == 0)
         sym.flags |= NEEDS_THUMB_TO_ARM_THUNK;
       break;
     case R_ARM_MOVT_PREL:
     case R_ARM_THM_MOVT_PREL:
-    case R_ARM_PREL31: {
-      Action table[][4] = {
-        // Absolute  Local    Imported data  Imported code
-        {  ERROR,    NONE,    ERROR,         PLT   },      // DSO
-        {  ERROR,    NONE,    COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,    COPYREL,       PLT   },      // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_ARM_PREL31:
+      scan_pcrel_rel(ctx, sym, rel);
       break;
-    }
     case R_ARM_TLS_GD32:
       sym.flags |= NEEDS_TLSGD;
       break;
@@ -447,6 +416,8 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       if (!ctx.relax_tlsdesc || sym.is_imported)
         sym.flags |= NEEDS_TLSDESC;
       break;
+    case R_ARM_REL32:
+    case R_ARM_BASE_PREL:
     case R_ARM_THM_JUMP11:
     case R_ARM_MOVW_PREL_NC:
     case R_ARM_MOVW_ABS_NC:
@@ -565,32 +536,30 @@ void sort_arm_exidx(Context<E> &ctx) {
   Entry *ent = (Entry *)(ctx.buf + osec->shdr.sh_offset);
   i64 num_entries = osec->shdr.sh_size / sizeof(Entry);
 
-  // Entry's addresses are relative to the beginning of their entries.
-  // We first translate them so that they are relative to the
-  // beginning of the section. We then sort the records and then
-  // translate them back to be relative to each record.
-
+  // Entry's addresses are relative to themselves. In order to sort
+  // records by addresses, we first translate them so that the addresses
+  // are relative to the beginning of the section.
   auto is_relative = [](u32 val) {
     return val != EXIDX_CANTUNWIND && !(val & 0x8000'0000);
   };
 
   tbb::parallel_for((i64)0, num_entries, [&](i64 i) {
     i64 offset = sizeof(Entry) * i;
-    ent[i].addr = sign_extend(ent[i].addr, 30) - offset;
+    ent[i].addr = sign_extend(ent[i].addr, 30) + offset;
     if (is_relative(ent[i].val))
-      ent[i].val = 0x7fff'ffff & (sign_extend(ent[i].val, 30) - offset);
+      ent[i].val = 0x7fff'ffff & (sign_extend(ent[i].val, 30) + offset);
   });
 
   tbb::parallel_sort(ent, ent + num_entries, [](const Entry &a, const Entry &b) {
     return a.addr < b.addr;
   });
 
-  // Write back the sorted records while adjusting relative addresses
+  // Make addresses relative to themselves.
   tbb::parallel_for((i64)0, num_entries, [&](i64 i) {
     i64 offset = sizeof(Entry) * i;
-    ent[i].addr = 0x7fff'ffff & (ent[i].addr + offset);
+    ent[i].addr = 0x7fff'ffff & (ent[i].addr - offset);
     if (is_relative(ent[i].val))
-      ent[i].val = 0x7fff'ffff & (ent[i].val + offset);
+      ent[i].val = 0x7fff'ffff & (ent[i].val - offset);
   });
 }
 

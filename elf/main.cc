@@ -12,19 +12,77 @@
 #include <sys/types.h>
 #include <tbb/global_control.h>
 #include <tbb/parallel_for_each.h>
-#include <unistd.h>
 #include <unordered_set>
 
+#ifdef _WIN32
+# include <direct.h>
+# define _chdir chdir
+#else
+# include <unistd.h>
+#endif
+
 namespace mold::elf {
+
+// Read the beginning of a given file and returns its machine type
+// (e.g. EM_X86_64 or EM_386).
+template <typename E>
+static MachineType get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+  auto get_elf_type = [](u8 *buf) {
+    switch (ElfEhdr<E> &ehdr = *(ElfEhdr<E> *)buf; ehdr.e_machine) {
+    case EM_386:
+      return MachineType::I386;
+    case EM_X86_64:
+      return MachineType::X86_64;
+    case EM_ARM:
+      return MachineType::ARM32;
+    case EM_AARCH64:
+      return MachineType::ARM64;
+    case EM_RISCV:
+      return (ehdr.e_ident[EI_CLASS] == ELFCLASS64)
+        ? MachineType::RISCV64 : MachineType::RISCV32;
+    default:
+      return MachineType::NONE;
+    }
+  };
+
+  switch (get_file_type(mf)) {
+  case FileType::ELF_OBJ:
+  case FileType::ELF_DSO:
+  case FileType::GCC_LTO_OBJ:
+    return get_elf_type(mf->data);
+  case FileType::AR:
+    for (MappedFile<Context<E>> *child : read_fat_archive_members(ctx, mf))
+      if (get_file_type(child) == FileType::ELF_OBJ)
+        return get_elf_type(child->data);
+    return MachineType::NONE;
+  case FileType::THIN_AR:
+    for (MappedFile<Context<E>> *child : read_thin_archive_members(ctx, mf))
+      if (get_file_type(child) == FileType::ELF_OBJ)
+        return get_elf_type(child->data);
+    return MachineType::NONE;
+  case FileType::TEXT:
+    return get_script_output_type(ctx, mf);
+  default:
+    return MachineType::NONE;
+  }
+}
+
+template <typename E>
+static void
+check_file_compatibility(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+  MachineType mt = get_machine_type(ctx, mf);
+  if (mt != ctx.arg.emulation)
+    Fatal(ctx) << mf->name << ": incompatible file type: "
+               << ctx.arg.emulation << " is expected but got " << mt;
+}
 
 template <typename E>
 static ObjectFile<E> *new_object_file(Context<E> &ctx, MappedFile<Context<E>> *mf,
                                       std::string archive_name) {
-  if (i64 type = ((ElfEhdr<E> *)mf->data)->e_machine; type != E::e_machine)
-    Fatal(ctx) << mf->name << ": incompatible file type: " << type;
-
   static Counter count("parsed_objs");
   count++;
+
+  check_file_compatibility(ctx, mf);
 
   bool in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
   ObjectFile<E> *file = ObjectFile<E>::create(ctx, mf, archive_name, in_lib);
@@ -58,8 +116,7 @@ static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile<Context<E>> *mf,
 template <typename E>
 static SharedFile<E> *
 new_shared_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
-  if (i64 type = ((ElfEhdr<E> *)mf->data)->e_machine; type != E::e_machine)
-    Fatal(ctx) << mf->name << ": incompatible file type: " << type;
+  check_file_compatibility(ctx, mf);
 
   SharedFile<E> *file = SharedFile<E>::create(ctx, mf);
   file->priority = ctx.file_priority++;
@@ -110,44 +167,18 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
       ctx.objs.push_back(file);
     return;
   default:
-    Fatal(ctx) << mf->name << ": unknown file type: " << type;
-  }
-}
-
-// Read the beginning of a given file and returns its machine type
-// (e.g. EM_X86_64 or EM_386). Return -1 if unknown.
-template <typename E>
-static i64 get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
-  switch (get_file_type(mf)) {
-  case FileType::ELF_OBJ:
-  case FileType::ELF_DSO:
-  case FileType::GCC_LTO_OBJ:
-    return ((ElfEhdr<E> *)mf->data)->e_machine;
-  case FileType::AR:
-    for (MappedFile<Context<E>> *child : read_fat_archive_members(ctx, mf))
-      if (get_file_type(child) == FileType::ELF_OBJ)
-        return ((ElfEhdr<E> *)child->data)->e_machine;
-    return -1;
-  case FileType::THIN_AR:
-    for (MappedFile<Context<E>> *child : read_thin_archive_members(ctx, mf))
-      if (get_file_type(child) == FileType::ELF_OBJ)
-        return ((ElfEhdr<E> *)child->data)->e_machine;
-    return -1;
-  case FileType::TEXT:
-    return get_script_output_type(ctx, mf);
-  default:
-    return -1;
+    Fatal(ctx) << mf->name << ": unknown file type";
   }
 }
 
 template <typename E>
-static i64
+static MachineType
 deduce_machine_type(Context<E> &ctx, std::span<std::string> args) {
   for (std::string_view arg : args)
     if (!arg.starts_with('-'))
       if (auto *mf = MappedFile<Context<E>>::open(ctx, std::string(arg)))
-        if (i64 type = get_machine_type(ctx, mf); type != -1)
-          return type;
+        if (MachineType ty = get_machine_type(ctx, mf); ty != MachineType::NONE)
+          return ty;
   Fatal(ctx) << "-m option is missing";
 }
 
@@ -157,10 +188,10 @@ MappedFile<Context<E>> *open_library(Context<E> &ctx, std::string path) {
   if (!mf)
     return nullptr;
 
-  i64 type = get_machine_type(ctx, mf);
-  if (type == -1 || type == E::e_machine)
+  MachineType ty = get_machine_type(ctx, mf);
+  if (ty == MachineType::NONE || ty == E::machine_type)
     return mf;
-  Warn(ctx) << path << ": skipping incompatible file " << (int)type
+  Warn(ctx) << path << ": skipping incompatible file " << (int)ty
             << " " << (int)E::e_machine;
   return nullptr;
 }
@@ -198,14 +229,6 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     std::string_view arg = args[0];
     args = args.subspan(1);
 
-    auto starts_with = [&](std::string_view prefix) {
-      if (arg.starts_with(prefix)) {
-        arg = arg.substr(prefix.size());
-        return true;
-      }
-      return false;
-    };
-
     if (arg == "--as-needed") {
       ctx.as_needed = true;
     } else if (arg == "--no-as-needed") {
@@ -222,16 +245,17 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
       ctx.in_lib = true;
     } else if (arg == "--end-lib") {
       ctx.in_lib = false;
-    } else if (starts_with("--version-script=")) {
+    } else if (remove_prefix(arg, "--version-script=")) {
       parse_version_script(ctx, std::string(arg));
-    } else if (starts_with("--dynamic-list=")) {
+    } else if (remove_prefix(arg, "--dynamic-list=")) {
       parse_dynamic_list(ctx, std::string(arg));
-    } else if (starts_with("--export-dynamic-symbol=")) {
+    } else if (remove_prefix(arg, "--export-dynamic-symbol=")) {
       if (arg == "*")
         ctx.default_version = VER_NDX_GLOBAL;
       else
         ctx.version_patterns.push_back({arg, VER_NDX_GLOBAL, false});
-    } else if (starts_with("--export-dynamic-symbol-list=")) {
+      ctx.version_specified = true;
+    } else if (remove_prefix(arg, "--export-dynamic-symbol-list=")) {
       parse_dynamic_list(ctx, std::string(arg));
     } else if (arg == "--push-state") {
       state.push_back({ctx.as_needed, ctx.whole_archive, ctx.is_static,
@@ -242,7 +266,7 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
       std::tie(ctx.as_needed, ctx.whole_archive, ctx.is_static, ctx.in_lib) =
         state.back();
       state.pop_back();
-    } else if (starts_with("-l")) {
+    } else if (remove_prefix(arg, "-l")) {
       MappedFile<Context<E>> *mf = find_library(ctx, std::string(arg));
       mf->given_fullpath = false;
       read_file(ctx, mf);
@@ -255,56 +279,6 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
     Fatal(ctx) << "no input files";
 
   ctx.tg.wait();
-}
-
-template <typename E>
-static i64 get_mtime(Context<E> &ctx, std::string path) {
-  struct stat st;
-  if (stat(path.c_str(), &st) < 0)
-    Fatal(ctx) << path << ": stat failed: " << errno_string();
-  return st.st_mtime;
-}
-
-template <typename E>
-static bool reload_input_files(Context<E> &ctx) {
-  Timer t(ctx, "reload_input_files");
-
-  std::vector<ObjectFile<E> *> objs;
-  std::vector<SharedFile<E> *> dsos;
-
-  // Reload updated .o files
-  for (ObjectFile<E> *file : ctx.objs) {
-    if (file->mf->parent) {
-      if (get_mtime(ctx, file->mf->parent->name) != file->mf->parent->mtime)
-        return false;
-      objs.push_back(file);
-      continue;
-    }
-
-    if (get_mtime(ctx, file->mf->name) == file->mf->mtime) {
-      objs.push_back(file);
-      continue;
-    }
-
-    MappedFile<Context<E>> *mf =
-      MappedFile<Context<E>>::must_open(ctx, file->mf->name);
-    objs.push_back(new_object_file(ctx, mf, file->mf->name));
-  }
-
-  // Reload updated .so files
-  for (SharedFile<E> *file : ctx.dsos) {
-    if (get_mtime(ctx, file->mf->name) == file->mf->mtime) {
-      dsos.push_back(file);
-    } else {
-      MappedFile<Context<E>> *mf =
-        MappedFile<Context<E>>::must_open(ctx, file->mf->name);
-      dsos.push_back(new_shared_file(ctx, mf));
-    }
-  }
-
-  ctx.objs = objs;
-  ctx.dsos = dsos;
-  return true;
 }
 
 template <typename E>
@@ -379,33 +353,40 @@ static int elf_main(int argc, char **argv) {
   Context<E> ctx;
 
   // Process -run option first. process_run_subcommand() does not return.
-  if (argc >= 2)
-    if (argv[1] == "-run"sv || argv[1] == "--run"sv)
-      process_run_subcommand(ctx, argc, argv);
+  if (argc >= 2 && (argv[1] == "-run"sv || argv[1] == "--run"sv)) {
+#if defined(_WIN32) || defined(__APPLE__)
+    Fatal(ctx) << ": -run is supported only on Unix";
+#endif
+    process_run_subcommand(ctx, argc, argv);
+  }
 
   // Parse non-positional command line options
   ctx.cmdline_args = expand_response_files(ctx, argv);
   std::vector<std::string> file_args = parse_nonpositional_args(ctx);
 
   // If no -m option is given, deduce it from input files.
-  if (ctx.arg.emulation == -1)
+  if (ctx.arg.emulation == MachineType::NONE)
     ctx.arg.emulation = deduce_machine_type(ctx, file_args);
 
   // Redo if -m is not x86-64.
-  if (ctx.arg.emulation != E::e_machine) {
-#if !MOLD_DEBUG_X86_64_ONLY && !MOLD_DEBUG_ARM64_ONLY
+  if (ctx.arg.emulation != E::machine_type) {
+#ifndef MOLD_DEBUG_X86_64_ONLY
     switch (ctx.arg.emulation) {
-    case EM_386:
+    case MachineType::I386:
       return elf_main<I386>(argc, argv);
-    case EM_AARCH64:
+    case MachineType::ARM64:
       return elf_main<ARM64>(argc, argv);
-    case EM_ARM:
+    case MachineType::ARM32:
       return elf_main<ARM32>(argc, argv);
-    case EM_RISCV:
+    case MachineType::RISCV64:
       return elf_main<RISCV64>(argc, argv);
+    case MachineType::RISCV32:
+      return elf_main<RISCV32>(argc, argv);
+    default:
+      unreachable();
     }
 #endif
-    Fatal(ctx) << "unknown emulation: " << ctx.arg.emulation;
+    unreachable();
   }
 
   Timer t_all(ctx, "all");
@@ -424,8 +405,11 @@ static int elf_main(int argc, char **argv) {
 
   // Fork a subprocess unless --no-fork is given.
   std::function<void()> on_complete;
+
+#if !defined(_WIN32) && !defined(__APPLE__)
   if (ctx.arg.fork)
     on_complete = fork_child();
+#endif
 
   tbb::global_control tbb_cont(tbb::global_control::max_allowed_parallelism,
                                ctx.arg.thread_count);
@@ -458,6 +442,9 @@ static int elf_main(int argc, char **argv) {
 
   // Apply -exclude-libs
   apply_exclude_libs(ctx);
+
+  // Create a dummy file containing linker-synthesized symbols.
+  create_internal_file(ctx);
 
   // Resolve symbols and fix the set of object files that are
   // included to the final output.
@@ -506,10 +493,8 @@ static int elf_main(int argc, char **argv) {
   // Get a list of output sections.
   append(ctx.chunks, collect_output_sections(ctx));
 
-  // Create a dummy file containing linker-synthesized symbols
-  // (e.g. `__bss_start`).
-  ctx.internal_obj = create_internal_file(ctx);
-  ctx.objs.push_back(ctx.internal_obj);
+  // Add synthetic symbols such as __ehdr_start or __end.
+  add_synthetic_symbols(ctx);
 
   // Beyond this point, no new files will be added to ctx.objs
   // or ctx.dsos.
@@ -657,7 +642,7 @@ static int elf_main(int argc, char **argv) {
   // that they can jump to anywhere in ±2 GiB by default. They may
   // be replaced with shorter instruction sequences if destinations
   // are close enough. Do this optimization.
-  if constexpr (std::is_same_v<E, RISCV64>)
+  if constexpr (std::is_same_v<E, RISCV64> || std::is_same_v<E, RISCV32>)
     filesize = riscv_resize_sections(ctx);
 
   // Fix linker-synthesized symbol addresses.
@@ -756,11 +741,7 @@ static int elf_main(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-#if MOLD_DEBUG_ARM64_ONLY
-  return elf_main<ARM64>(argc, argv);
-#else
   return elf_main<X86_64>(argc, argv);
-#endif
 }
 
 #define INSTANTIATE(E)                                                  \

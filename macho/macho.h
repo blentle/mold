@@ -162,13 +162,13 @@ static constexpr u32 S_THREAD_LOCAL_VARIABLE_POINTERS = 0x14;
 static constexpr u32 S_THREAD_LOCAL_INIT_FUNCTION_POINTERS = 0x15;
 static constexpr u32 S_INIT_FUNC_OFFSETS = 0x16;
 
-static constexpr u32 S_ATTR_LOC_RELOC = 0x000001;
-static constexpr u32 S_ATTR_EXT_RELOC = 0x000002;
-static constexpr u32 S_ATTR_SOME_INSTRUCTIONS = 0x000004;
+static constexpr u32 S_ATTR_LOC_RELOC = 0x1;
+static constexpr u32 S_ATTR_EXT_RELOC = 0x2;
+static constexpr u32 S_ATTR_SOME_INSTRUCTIONS = 0x4;
 
-static constexpr u32 S_ATTR_DEBUG = 0x020000;
-static constexpr u32 S_ATTR_SELF_MODIFYING_CODE = 0x040000;
-static constexpr u32 S_ATTR_LIVE_SUPPORT = 0x080000;
+static constexpr u32 S_ATTR_DEBUG = 0x20000;
+static constexpr u32 S_ATTR_SELF_MODIFYING_CODE = 0x40000;
+static constexpr u32 S_ATTR_LIVE_SUPPORT = 0x80000;
 static constexpr u32 S_ATTR_NO_DEAD_STRIP = 0x100000;
 static constexpr u32 S_ATTR_STRIP_STATIC_SYMS = 0x200000;
 static constexpr u32 S_ATTR_NO_TOC = 0x400000;
@@ -317,7 +317,7 @@ static constexpr u32 PLATFORM_DRIVERKIT = 10;
 static constexpr u32 TOOL_CLANG = 1;
 static constexpr u32 TOOL_SWIFT = 2;
 static constexpr u32 TOOL_LD = 3;
-static constexpr u32 TOOL_MOLD = 0x6d6f6c64; // Hex in "mold"
+static constexpr u32 TOOL_MOLD = 54321; // Randomly chosen!
 
 static constexpr u32 OBJC_IMAGE_SUPPORTS_GC = 1 << 1;
 static constexpr u32 OBJC_IMAGE_REQUIRES_GC = 1 << 2;
@@ -325,6 +325,15 @@ static constexpr u32 OBJC_IMAGE_OPTIMIZED_BY_DYLD = 1 << 3;
 static constexpr u32 OBJC_IMAGE_SUPPORTS_COMPACTION = 1 << 4;
 static constexpr u32 OBJC_IMAGE_IS_SIMULATED = 1 << 5;
 static constexpr u32 OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES = 1 << 6;
+
+static constexpr u32 LOH_ARM64_ADRP_ADRP = 1;
+static constexpr u32 LOH_ARM64_ADRP_LDR = 2;
+static constexpr u32 LOH_ARM64_ADRP_ADD_LDR = 3;
+static constexpr u32 LOH_ARM64_ADRP_LDR_GOT_LDR = 4;
+static constexpr u32 LOH_ARM64_ADRP_ADD_STR = 5;
+static constexpr u32 LOH_ARM64_ADRP_LDR_GOT_STR = 6;
+static constexpr u32 LOH_ARM64_ADRP_ADD = 7;
+static constexpr u32 LOH_ARM64_ADRP_LDR_GOT = 8;
 
 static constexpr u32 ARM64_RELOC_UNSIGNED = 0;
 static constexpr u32 ARM64_RELOC_SUBTRACTOR = 1;
@@ -750,8 +759,8 @@ struct ObjcImageInfo {
 struct ARM64 {
   static constexpr u32 cputype = CPU_TYPE_ARM64;
   static constexpr u32 cpusubtype = CPU_SUBTYPE_ARM64_ALL;
+  static constexpr u32 page_size = 16384;
   static constexpr u32 abs_rel = ARM64_RELOC_UNSIGNED;
-  static constexpr u32 word_size = 8;
   static constexpr u32 stub_size = 12;
   static constexpr u32 stub_helper_hdr_size = 24;
   static constexpr u32 stub_helper_size = 12;
@@ -760,11 +769,13 @@ struct ARM64 {
 struct X86_64 {
   static constexpr u32 cputype = CPU_TYPE_X86_64;
   static constexpr u32 cpusubtype = CPU_SUBTYPE_X86_64_ALL;
+  static constexpr u32 page_size = 4096;
   static constexpr u32 abs_rel = X86_64_RELOC_UNSIGNED;
-  static constexpr u32 word_size = 8;
   static constexpr u32 stub_size = 6;
   static constexpr u32 stub_helper_hdr_size = 16;
   static constexpr u32 stub_helper_size = 10;
 };
+
+inline constexpr size_t word_size = 8;
 
 } // namespace mold::macho

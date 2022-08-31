@@ -61,7 +61,7 @@ necessary packages. You may want to run it as root.
 ```shell
 git clone https://github.com/rui314/mold.git
 cd mold
-git checkout v1.3.1
+git checkout v1.4.1
 make -j$(nproc) CXX=clang++
 sudo make install
 ```
@@ -117,7 +117,7 @@ take an absolute path as an argument for `-fuse-ld` though.
 
 Create `.cargo/config.toml` in your project directory with the following:
 
-```
+```toml
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=/path/to/mold"]
@@ -128,6 +128,19 @@ Please make sure you have installed `clang`.
 
 If you want to use mold for all projects, put the above snippet to
 `~/.cargo/config.toml`.
+
+If you are using macOS, you can modify `config.toml` in a similar manner.
+Here is an example with `mold` installed via [Homebrew](https://brew.sh).
+
+```toml
+[target.x86_64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
 
 </details>
 
@@ -147,6 +160,20 @@ Internally, mold invokes a given command with `LD_PRELOAD` environment
 variable set to its companion shared object file. The shared object
 file intercepts all function calls to `exec(3)`-family functions to
 replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
+
+</details>
+
+<details><summary>On macOS</summary>
+
+mold/macOS is available as an alpha version. It can be used to build not
+only macOS apps but also iOS apps because their binary formats are the same.
+
+The command name of mold/macOS is `ld64.mold`. If you build mold on macOS,
+it still produces `mold` and `ld.mold`, but these executables are useful
+only for cross compilation (i.e. building Linux apps on macOS.)
+
+If you find any issue with mold/macOS, please file it to
+<a href=https://github.com/rui314/mold/issues>our GitHub Issues</a>.
 
 </details>
 
@@ -174,6 +201,15 @@ String dump of section '.comment':
 ```
 
 If `mold` is in `.comment`, the file is created by mold.
+
+</details>
+
+<details><summary>Online manual</summary>
+
+Since mold is a drop-in replacement, you should be able to use it
+without reading its manual. But just in case you need it, it's available
+online at <a href=https://rui314.github.io/mold.html>here</a>.
+You can also read the same manual by `man mold`.
 
 </details>
 
@@ -214,3 +250,16 @@ it. A legally-binding commercial license contract addresses the
 concern. By purchasing a license, you are guaranteed that mold will be
 maintained for you. Please [contact us](mailto:contact@bluewhale.systems)
 for a commercial license inquiry.
+
+## Acknowledgement
+
+We accept donations via [GitHub Sponsors](https://github.com/sponsors/rui314)
+and [OpenCollective](https://opencollective.com/mold-linker).
+We thank you to everybody who sponsors our project. In particular,
+we'd like to acknowledge the following people and organizations who
+have sponsored $128/month or more:
+
+- [300baud](https://github.com/300baud)
+- [Mercury](https://github.com/MercuryTechnologies)
+- [Wei Wu](https://github.com/lazyparser)
+- [Signal Slot Inc.](https://github.com/signal-slot)

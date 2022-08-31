@@ -8,12 +8,16 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/global_control.h>
 #include <tbb/parallel_for_each.h>
+
+#ifndef _WIN32
+# include <sys/mman.h>
+# include <sys/time.h>
+#endif
 
 namespace mold::macho {
 
@@ -37,12 +41,16 @@ template <typename E>
 static void resolve_symbols(Context<E> &ctx) {
   Timer t(ctx, "resolve_symbols");
 
-  auto for_each_file = [&](std::function<void(InputFile<E> *)> fn) {
-    tbb::parallel_for_each(ctx.objs, fn);
-    tbb::parallel_for_each(ctx.dylibs, fn);
-  };
+  std::vector<InputFile<E> *> files;
+  append(files, ctx.objs);
+  append(files, ctx.dylibs);
 
-  for_each_file([&](InputFile<E> *file) { file->resolve_symbols(ctx); });
+  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
+    file->resolve_symbols(ctx);
+  });
+
+  if (has_lto_obj(ctx))
+    do_lto(ctx);
 
   for (std::string_view name : ctx.arg.u)
     if (InputFile<E> *file = get_symbol(ctx, name)->file)
@@ -63,18 +71,20 @@ static void resolve_symbols(Context<E> &ctx) {
   }
 
   // Remove symbols of eliminated files.
-  for_each_file([&](InputFile<E> *file) {
+  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
     if (!file->is_alive)
       file->clear_symbols();
   });
 
+  // Redo symbol resolution because extracting object files from archives
+  // may raise the priority of symbols defined by the object file.
+  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
+    if (file->is_alive)
+      file->resolve_symbols(ctx);
+  });
+
   std::erase_if(ctx.objs, [](InputFile<E> *file) { return !file->is_alive; });
   std::erase_if(ctx.dylibs, [](InputFile<E> *file) { return !file->is_alive; });
-
-  for_each_file([&](InputFile<E> *file) { file->resolve_symbols(ctx); });
-
-  if (has_lto_obj(ctx))
-    do_lto(ctx);
 }
 
 template <typename E>
@@ -323,6 +333,10 @@ static void create_synthetic_chunks(Context<E> &ctx) {
 
   // Create a __DATA,__objc_imageinfo section.
   ctx.image_info = ObjcImageInfoSection<E>::create(ctx);
+
+  // Create a __LINKEDIT,__func_starts section.
+  if (ctx.arg.function_starts)
+    ctx.function_starts.reset(new FunctionStartsSection(ctx));
 
   // Handle -sectcreate
   for (SectCreateOption arg : ctx.arg.sectcreate) {
@@ -579,27 +593,32 @@ static void fix_synthetic_symbol_values(Context<E> &ctx) {
   };
 
   for (Symbol<E> *sym : ctx.internal_obj->syms) {
-    if (std::string_view s = "segment$start$"; sym->name.starts_with(s)) {
+    std::string_view name = sym->name;
+
+    if (remove_prefix(name, "segment$start$")) {
       sym->value = ctx.text->hdr.addr;
-      if (SegmentCommand *cmd = find_segment(sym->name.substr(s.size())))
+      if (SegmentCommand *cmd = find_segment(name))
         sym->value = cmd->vmaddr;
+      continue;
     }
 
-    if (std::string_view s = "segment$end$"; sym->name.starts_with(s)) {
+    if (remove_prefix(name, "segment$end$")) {
       sym->value = ctx.text->hdr.addr;
-      if (SegmentCommand *cmd = find_segment(sym->name.substr(s.size())))
+      if (SegmentCommand *cmd = find_segment(name))
         sym->value = cmd->vmaddr + cmd->vmsize;
+      continue;
     }
 
-    if (std::string_view s = "section$start$"; sym->name.starts_with(s)) {
+    if (remove_prefix(name, "section$start$")) {
       sym->value = ctx.text->hdr.addr;
-      if (MachSection *hdr = find_section(sym->name.substr(s.size())))
+      if (MachSection *hdr = find_section(name))
         sym->value = hdr->addr;
+      continue;
     }
 
-    if (std::string_view s = "section$end$"; sym->name.starts_with(s)) {
+    if (remove_prefix(name, "section$end$")) {
       sym->value = ctx.text->hdr.addr;
-      if (MachSection *hdr = find_section(sym->name.substr(s.size())))
+      if (MachSection *hdr = find_section(name))
         sym->value = hdr->addr + hdr->size;
     }
   }
@@ -643,58 +662,13 @@ static void compute_uuid(Context<E> &ctx) {
   tbb::parallel_for((i64)0, num_shards, [&](i64 i) {
     u8 *begin = ctx.buf + shard_size * i;
     u8 *end = (i == num_shards - 1) ? ctx.buf + filesize : begin + shard_size;
-    SHA256(begin, end - begin, shards.data() + i * SHA256_SIZE);
+    sha256_hash(begin, end - begin, shards.data() + i * SHA256_SIZE);
   });
 
   u8 buf[SHA256_SIZE];
-  SHA256(shards.data(), shards.size(), buf);
+  sha256_hash(shards.data(), shards.size(), buf);
   memcpy(ctx.uuid, buf, 16);
   ctx.mach_hdr.copy_buf(ctx);
-}
-
-template <typename E>
-MappedFile<Context<E>> *find_framework(Context<E> &ctx, std::string name) {
-  std::string suffix;
-  std::tie(name, suffix) = split_string(name, ',');
-
-  for (std::string path : ctx.arg.framework_paths) {
-    path = get_realpath(path + "/" + name + ".framework/" + name);
-
-    if (!suffix.empty())
-      if (auto *mf = MappedFile<Context<E>>::open(ctx, path + suffix))
-        return mf;
-
-    if (auto *mf = MappedFile<Context<E>>::open(ctx, path + ".tbd"))
-      return mf;
-
-    if (auto *mf = MappedFile<Context<E>>::open(ctx, path))
-      return mf;
-  }
-  Fatal(ctx) << "-framework not found: " << name;
-}
-
-template <typename E>
-MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string name) {
-  auto search = [&](std::vector<std::string> extn) -> MappedFile<Context<E>> * {
-    for (std::string dir : ctx.arg.library_paths) {
-      for (std::string e : extn) {
-        std::string path = dir + "/lib" + name + e;
-        if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path))
-          return mf;
-        ctx.missing_files.insert(path);
-      }
-    }
-    return nullptr;
-  };
-
-  // -search_paths_first
-  if (ctx.arg.search_paths_first)
-    return search({".tbd", ".dylib", ".a"});
-
-  // -search_dylibs_first
-  if (MappedFile<Context<E>> *mf = search({".tbd", ".dylib"}))
-    return mf;
-  return search({".a"});
 }
 
 template <typename E>
@@ -719,20 +693,13 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   case FileType::TAPI:
   case FileType::MACH_DYLIB:
   case FileType::MACH_EXE:
-    if (ctx.loaded_files.insert(mf->name).second)
-      ctx.dylibs.push_back(DylibFile<E>::create(ctx, mf));
+    ctx.dylibs.push_back(DylibFile<E>::create(ctx, mf));
     break;
   case FileType::MACH_OBJ:
   case FileType::LLVM_BITCODE:
     ctx.objs.push_back(ObjectFile<E>::create(ctx, mf, ""));
     break;
   case FileType::AR:
-    if (!ctx.all_load && !ctx.loaded_files.insert(mf->name).second) {
-      // If the same .a file is specified more than once, ignore all
-      // but the first one because they would be ignored anyway.
-      break;
-    }
-
     for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf))
       if (get_file_type(child) == FileType::MACH_OBJ)
         ctx.objs.push_back(ObjectFile<E>::create(ctx, child, mf->name));
@@ -781,11 +748,71 @@ template <typename E>
 static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
   Timer t(ctx, "read_input_files");
 
-  auto must_find_library = [&](std::string arg) {
-    MappedFile<Context<E>> *mf = find_library(ctx, arg);
+  std::unordered_set<std::string> libs;
+  std::unordered_set<std::string> frameworks;
+
+  auto search = [&](std::vector<std::string> names)
+      -> MappedFile<Context<E>> * {
+    for (std::string dir : ctx.arg.library_paths) {
+      for (std::string name : names) {
+        std::string path = dir + "/lib" + name;
+        if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path))
+          return mf;
+        ctx.missing_files.insert(path);
+      }
+    }
+    return nullptr;
+  };
+
+  auto find_library = [&](std::string name) -> MappedFile<Context<E>> * {
+    // -search_paths_first
+    if (ctx.arg.search_paths_first)
+      return search({name + ".tbd", name + ".dylib", name + ".a"});
+
+    // -search_dylibs_first
+    if (MappedFile<Context<E>> *mf = search({name + ".tbd", name + ".dylib"}))
+      return mf;
+    return search({name + ".a"});
+  };
+
+  auto read_library = [&](std::string name) {
+    if (!libs.insert(name).second)
+      return;
+
+    MappedFile<Context<E>> *mf = find_library(name);
     if (!mf)
-      Fatal(ctx) << "library not found: -l" << arg;
-    return mf;
+      Fatal(ctx) << "library not found: -l" << name;
+    read_file(ctx, mf);
+  };
+
+  auto find_framework = [&](std::string name) -> MappedFile<Context<E>> * {
+    std::string suffix;
+    std::tie(name, suffix) = split_string(name, ',');
+
+    for (std::string path : ctx.arg.framework_paths) {
+      path = get_realpath(path + "/" + name + ".framework/" + name);
+
+      if (!suffix.empty())
+        if (auto *mf = MappedFile<Context<E>>::open(ctx, path + suffix))
+          return mf;
+
+      if (auto *mf = MappedFile<Context<E>>::open(ctx, path + ".tbd"))
+        return mf;
+
+      if (auto *mf = MappedFile<Context<E>>::open(ctx, path))
+        return mf;
+    }
+    return nullptr;
+  };
+
+  auto read_framework = [&](std::string name) {
+    if (!frameworks.insert(name).second)
+      return;
+
+    MappedFile<Context<E>> *mf = find_framework(name);
+    if (!mf)
+      Fatal(ctx) << "-framework not found: " << name;
+    read_file(ctx, mf);
   };
 
   while (!args.empty()) {
@@ -826,27 +853,27 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
       read_file(ctx, MappedFile<Context<E>>::must_open(ctx, arg));
       ctx.all_load = orig;
     } else if (opt == "-framework") {
-      read_file(ctx, find_framework(ctx, arg));
+      read_framework(arg);
     } else if (opt == "-needed_framework") {
       ctx.needed_l = true;
-      read_file(ctx, find_framework(ctx, arg));
+      read_framework(arg);
     } else if (opt == "-weak_framework") {
       ctx.weak_l = true;
-      read_file(ctx, find_framework(ctx, arg));
+      read_framework(arg);
     } else if (opt == "-l") {
-      read_file(ctx, must_find_library(arg));
+      read_library(arg);
     } else if (opt == "-needed-l") {
       ctx.needed_l = true;
-      read_file(ctx, must_find_library(arg));
+      read_library(arg);
     } else if (opt == "-hidden-l") {
       ctx.hidden_l = true;
-      read_file(ctx, must_find_library(arg));
+      read_library(arg);
     } else if (opt == "-weak-l") {
       ctx.weak_l = true;
-      read_file(ctx, must_find_library(arg));
+      read_library(arg);
     } else if (opt == "-reexport-l") {
       ctx.reexport_l = true;
-      read_file(ctx, must_find_library(arg));
+      read_library(arg);
     } else {
       unreachable();
     }
@@ -859,7 +886,7 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
 
   // With -bundle_loader, we can import symbols from a main executable.
   if (!ctx.arg.bundle_loader.empty())
-    read_file(ctx, MappedFile<Context<E>>::must_open(ctx, ctx.arg.bundle_loader));
+    read_library(ctx.arg.bundle_loader);
 
   // An object file can contain linker directives to load other object
   // files or libraries, so process them if any.
@@ -869,10 +896,15 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
 
     for (i64 j = 0; j < opts.size();) {
       if (opts[j] == "-framework") {
-        read_file(ctx, find_framework(ctx, opts[j + 1]));
+        if (frameworks.insert(opts[j + 1]).second)
+          if (MappedFile<Context<E>> *mf = find_framework(opts[j + 1]))
+            read_file(ctx, mf);
         j += 2;
       } else if (opts[j].starts_with("-l")) {
-        read_file(ctx, must_find_library(opts[j].substr(2)));
+        std::string name = opts[j].substr(2);
+        if (libs.insert(name).second)
+          if (MappedFile<Context<E>> *mf = find_library(name))
+            read_file(ctx, mf);
         j++;
       } else {
         Fatal(ctx) << *file << ": unknown LC_LINKER_OPTION command: " << opts[j];
@@ -960,7 +992,7 @@ static int do_main(int argc, char **argv) {
   std::vector<std::string> file_args = parse_nonpositional_args(ctx);
 
   if (ctx.arg.arch != E::cputype) {
-#if !defined(MOLD_DEBUG_X86_64_ONLY) && !defined(MOLD_DEBUG_ARM64_ONLY)
+#ifndef MOLD_DEBUG_X86_64_ONLY
     switch (ctx.arg.arch) {
     case CPU_TYPE_X86_64:
       return do_main<X86_64>(argc, argv);
@@ -1047,6 +1079,10 @@ static int do_main(int argc, char **argv) {
 
   copy_sections_to_output_file(ctx);
 
+  if constexpr (std::is_same_v<E, ARM64>)
+    if (!ctx.arg.ignore_optimization_hints)
+      apply_linker_optimization_hints(ctx);
+
   if (ctx.code_sig)
     ctx.code_sig->write_signature(ctx);
   else if (ctx.arg.uuid == UUID_HASH)
@@ -1079,15 +1115,6 @@ static int do_main(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-  if (!getenv("MOLD_SUPPRESS_MACHO_WARNING")) {
-    std::cerr <<
-R"(********************************************************************************
-mold for macOS is pre-alpha. Do not use unless you know what you are doing.
-Do not report bugs because it's too early to manage missing features as bugs.
-********************************************************************************
-)";
-  }
-
 #ifdef MOLD_DEBUG_X86_64_ONLY
   return do_main<X86_64>(argc, argv);
 #else

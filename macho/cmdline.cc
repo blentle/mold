@@ -6,8 +6,11 @@
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
 #include <unordered_set>
+
+#ifndef _WIN32
+# include <unistd.h>
+#endif
 
 namespace mold::macho {
 
@@ -63,6 +66,8 @@ Options:
                               Allocate MAXPATHLEN byte padding after load commands
   -help                       Report usage information
   -hidden-l<LIB>
+  -ignore_optimization_hints  Do not rewrite instructions as optimization (default)
+    -enable_optimization_hints
   -install_name <NAME>
   -l<LIB>                     Search for a given library
   -lto_library <FILE>         Ignored
@@ -73,6 +78,7 @@ Options:
   -needed-framework <NAME>[,<SUFFIX>]
                               Search for a given framework
   -no_deduplicate             Ignored
+  -no_function_starts         Do not generate an LC_FUNCTION_STARTS load command
   -no_uuid                    Do not generate an LC_UUID load command
   -o <FILE>                   Set output filename
   -objc_abi_version <VERSION> Ignored
@@ -95,7 +101,7 @@ Options:
   -t                          Print out each file the linker loads
   -thread_count <NUMBER>      Use given number of threads
   -u <SYMBOL>                 Force load a given symbol from archive if necessary
-  -uexported_symbol <SYMBOL>  Export all but a given symbol
+  -unexported_symbol <SYMBOL> Export all but a given symbol
   -unexported_symbols_list <FILE>
                               Read a list of unexported symbols from a given file
   -v                          Report version information
@@ -137,7 +143,7 @@ i64 parse_version(Context<E> &ctx, std::string_view arg) {
   static std::regex re(R"((\d+)(?:\.(\d+))?(?:\.(\d+))?)",
                        std::regex_constants::ECMAScript);
   std::cmatch m;
-  if (!std::regex_match(arg.begin(), arg.end(), m, re))
+  if (!std::regex_match(arg.data(), arg.data() + arg.size(), m, re))
     Fatal(ctx) << "malformed version number: " << arg;
 
   i64 major = (m[1].length() == 0) ? 0 : stoi(m[1]);
@@ -202,6 +208,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   std::vector<std::string> framework_paths;
   std::vector<std::string> library_paths;
   bool nostdlib = false;
+  bool version_shown = false;
   std::optional<i64> pagezero_size;
 
   while (i < args.size()) {
@@ -387,6 +394,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_joined("-hidden-l")) {
       remaining.push_back("-hidden-l");
       remaining.push_back(std::string(arg));
+    } else if (read_flag("-ignore_optimization_hints")) {
+      ctx.arg.ignore_optimization_hints = true;
+    } else if (read_flag("-enable_optimization_hints")) {
+      ctx.arg.ignore_optimization_hints = false;
     } else if (read_arg("-install_name") || read_arg("-dylib_install_name")) {
       ctx.arg.install_name = arg;
     } else if (read_joined("-l")) {
@@ -405,6 +416,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       remaining.push_back("-needed_framework");
       remaining.push_back(std::string(arg));
     } else if (read_flag("-no_deduplicate")) {
+    } else if (read_flag("-no_function_starts")) {
+      ctx.arg.function_starts = false;
     } else if (read_flag("-no_uuid")) {
       ctx.arg.uuid = UUID_NONE;
     } else if (read_arg("-o")) {
@@ -468,6 +481,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
                      << ": invalid glob pattern: " << pat;
     } else if (read_flag("-v")) {
       SyncOut(ctx) << mold_version;
+      version_shown = true;
     } else if (read_arg("-weak_framework")) {
       remaining.push_back("-weak_framework");
       remaining.push_back(std::string(arg));
@@ -545,6 +559,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.uuid == UUID_RANDOM)
     memcpy(ctx.uuid, get_uuid_v4().data(), 16);
 
+  if (version_shown && remaining.empty())
+    exit(0);
   return remaining;
 }
 
