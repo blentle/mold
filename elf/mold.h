@@ -34,22 +34,6 @@
 # include <unistd.h>
 #endif
 
-// MOLD_DEBUG_{X86_64,ARM64}_ONLY are macros to speed up builds.
-// This should be used only for debugging. When you use this flag,
-// you need to compile mold C++ files with `-ffunction-sections
-// -fdata-sections` and link them with -Wl,-gc-sections.
-#if MOLD_DEBUG_X86_64_ONLY
-# define INSTANTIATE_ALL INSTANTIATE(X86_64)
-#else
-# define INSTANTIATE_ALL                        \
-  INSTANTIATE(X86_64);                          \
-  INSTANTIATE(I386);                            \
-  INSTANTIATE(ARM64);                           \
-  INSTANTIATE(ARM32);                           \
-  INSTANTIATE(RISCV64);                         \
-  INSTANTIATE(RISCV32)
-#endif
-
 namespace mold::elf {
 
 static constexpr i32 SHA256_SIZE = 32;
@@ -95,27 +79,56 @@ struct SectionFragment {
   std::atomic_bool is_alive = false;
 };
 
-template <typename E>
-struct SectionFragmentRef {
-  SectionFragment<E> *frag = nullptr;
-  i32 idx = 0;
-  i32 addend = 0;
-};
-
 // Additional class members for dynamic symbols. Because most symbols
 // don't need them and we allocate tens of millions of symbol objects
 // for large programs, we separate them from `Symbol` class to save
 // memory.
 struct SymbolAux {
   i32 got_idx = -1;
-  i32 gotplt_idx = -1;
   i32 gottp_idx = -1;
   i32 tlsgd_idx = -1;
   i32 tlsdesc_idx = -1;
   i32 plt_idx = -1;
   i32 pltgot_idx = -1;
+  i32 opd_idx = -1;
   i32 dynsym_idx = -1;
 };
+
+//
+// thunks.cc
+//
+
+template <typename E>
+class RangeExtensionThunk {};
+
+template <typename E> requires needs_thunk<E>
+class RangeExtensionThunk<E> {
+public:
+  RangeExtensionThunk(OutputSection<E> &osec) : output_section(osec) {}
+  i64 size() const { return E::thunk_hdr_size + symbols.size() * E::thunk_size; }
+  void copy_buf(Context<E> &ctx);
+
+  u64 get_addr(i64 idx) const {
+    return output_section.shdr.sh_addr + offset + E::thunk_hdr_size +
+           idx * E::thunk_size;
+  }
+
+  static constexpr i64 alignment = 4;
+
+  OutputSection<E> &output_section;
+  i32 thunk_idx = -1;
+  i64 offset = -1;
+  std::mutex mu;
+  std::vector<Symbol<E> *> symbols;
+};
+
+struct RangeExtensionRef {
+  i32 thunk_idx = -1;
+  i32 sym_idx = -1;
+};
+
+template <typename E>
+void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec);
 
 //
 // input-sections.cc
@@ -156,7 +169,7 @@ struct CieRecord {
       rel_idx(rel_idx), rels(rels), contents(file.get_string(ctx, isec.shdr())) {}
 
   i64 size() const {
-    return *(ul32 *)(contents.data() + input_offset) + 4;
+    return *(U32<E> *)(contents.data() + input_offset) + 4;
   }
 
   std::string_view get_contents() const {
@@ -213,50 +226,52 @@ struct FdeRecord {
   std::atomic_bool is_alive = true;
 };
 
-template <typename E>
-class RangeExtensionThunk {};
-
-template <>
-class RangeExtensionThunk<ARM64> {
-public:
-  RangeExtensionThunk(OutputSection<ARM64> &osec)
-    : output_section(osec) {}
-
-  i64 size() const { return symbols.size() * ENTRY_SIZE; }
-  u64 get_addr(i64 idx) const;
-  void copy_buf(Context<ARM64> &ctx);
-
-  static constexpr i64 ENTRY_SIZE = 12;
-
-  OutputSection<ARM64> &output_section;
-  i32 thunk_idx = -1;
-  i64 offset = -1;
-  std::mutex mu;
-  std::vector<Symbol<ARM64> *> symbols;
-};
-
-struct RangeExtensionRef {
-  i32 thunk_idx = -1;
-  i32 sym_idx = -1;
-};
-
 // A struct to hold taret-dependent input section members.
 template <typename E>
 struct InputSectionExtras {};
 
-template <>
-struct InputSectionExtras<ARM64> {
+template <typename E> requires needs_thunk<E>
+struct InputSectionExtras<E> {
   std::vector<RangeExtensionRef> range_extn;
 };
 
-template <>
-struct InputSectionExtras<RISCV64> {
+template <typename E> requires is_riscv<E>
+struct InputSectionExtras<E> {
   std::vector<i32> r_deltas;
 };
 
-template <>
-struct InputSectionExtras<RISCV32> {
-  std::vector<i32> r_deltas;
+typedef enum { NONE, ERROR, COPYREL, PLT, CPLT, DYNREL, BASEREL } ScanAction;
+
+// This is a decision table for absolute relocations that is smaller
+// than the word size (e.g. R_X86_64_32). Since the dynamic linker
+// generally does not support dynamic relocations smaller than the
+// word size, we need to report an error if a relocation cannot be
+// resolved at link-time.
+constexpr static ScanAction absrel_table[3][4] = {
+  // Absolute  Local    Imported data  Imported code
+  {  NONE,     ERROR,   ERROR,         ERROR },  // Shared object
+  {  NONE,     ERROR,   ERROR,         ERROR },  // Position-independent exec
+  {  NONE,     NONE,    COPYREL,       CPLT  },  // Position-dependent exec
+};
+
+// This is a decision table for absolute relocations for the word
+// size data (e.g. R_X86_64_64). Unlike the absrel_table, we can emit
+// a dynamic relocation if we cannot resolve an address at link-time.
+constexpr static ScanAction dyn_absrel_table[3][4] = {
+  // Absolute  Local    Imported data  Imported code
+  {  NONE,     BASEREL, DYNREL,        DYNREL },  // Shared object
+  {  NONE,     BASEREL, DYNREL,        DYNREL },  // Position-independent exec
+  {  NONE,     NONE,    COPYREL,       CPLT   },  // Position-dependent exec
+};
+
+// This is for PC-relative relocations (e.g. R_X86_64_PC32).
+// We cannot promote them to dynamic relocations because the dynamic
+// linker generally does not support PC-relative relocations.
+constexpr static ScanAction pcrel_table[3][4] = {
+  // Absolute  Local    Imported data  Imported code
+  {  ERROR,    NONE,    ERROR,         PLT    },  // Shared object
+  {  ERROR,    NONE,    COPYREL,       PLT    },  // Position-independent exec
+  {  NONE,     NONE,    COPYREL,       CPLT   },  // Position-dependent exec
 };
 
 // InputSection represents a section in an input object file.
@@ -283,17 +298,18 @@ public:
   std::span<FdeRecord<E>> get_fdes() const;
   std::string_view get_func_name(Context<E> &ctx, i64 offset);
   bool is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel);
+  bool is_killed_by_icf() const;
 
   void record_undef_error(Context<E> &ctx, const ElfRel<E> &rel);
 
   ObjectFile<E> &file;
   OutputSection<E> *output_section = nullptr;
+  u64 sh_size = -1;
 
   std::string_view contents;
 
   [[no_unique_address]] InputSectionExtras<E> extra;
 
-  std::unique_ptr<SectionFragmentRef<E>[]> rel_fragments;
   i32 fde_begin = -1;
   i32 fde_end = -1;
 
@@ -301,41 +317,43 @@ public:
   u32 shndx = -1;
   u32 relsec_idx = -1;
   u32 reldyn_offset = 0;
-  u32 sh_size = -1;
 
   // For COMDAT de-duplication and garbage collection
   std::atomic_bool is_alive = true;
   u8 p2align = 0;
 
   bool address_significant : 1 = false;
-  bool compressed : 1 = false;
   bool uncompressed : 1 = false;
-  bool killed_by_icf : 1 = false;
 
   // For garbage collection
   std::atomic_bool is_visited = false;
 
   // For ICF
+  //
+  // `leader` is the section that this section has been merged with.
+  // Three kind of values are possible:
+  // - `leader == nullptr`: This section was not eligible for ICF.
+  // - `leader == this`: This section was retained.
+  // - `leader != this`: This section was merged with another identical section.
   InputSection<E> *leader = nullptr;
   u32 icf_idx = -1;
   bool icf_eligible = false;
   bool icf_leaf = false;
 
 private:
-  void scan_abs_rel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
-  void scan_abs_dyn_rel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
-  void scan_pcrel_rel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
+  void scan_rel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel,
+                const ScanAction table[3][4]);
 
-  void apply_abs_dyn_rel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel,
-                         u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> *&dynrel);
+  void apply_dyn_absrel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel,
+                        u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> *&dynrel,
+                        const ScanAction table[3][4] = dyn_absrel_table);
 
-  void copy_contents(Context<E> &ctx, u8 *buf);
   void copy_contents_riscv(Context<E> &ctx, u8 *buf);
 
   std::pair<SectionFragment<E> *, i64>
   get_fragment(Context<E> &ctx, const ElfRel<E> &rel);
 
-  std::optional<u64> get_tombstone(Symbol<E> &sym);
+  std::optional<u64> get_tombstone(Symbol<E> &sym, SectionFragment<E> *frag);
 };
 
 template <typename E>
@@ -346,7 +364,22 @@ void report_undef_errors(Context<E> &ctx);
 //
 
 template <typename E>
+u64 get_eflags(Context<E> &ctx);
+
+template <typename E>
+i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk);
+
+template <typename E>
 bool is_relro(Context<E> &ctx, Chunk<E> *chunk);
+
+template <typename E>
+void write_plt_header(Context<E> &ctx, u8 *buf);
+
+template <typename E>
+void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym);
+
+template <typename E>
+void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym);
 
 typedef enum { HEADER, OUTPUT_SECTION, SYNTHETIC } ChunkKind;
 
@@ -366,7 +399,18 @@ public:
   std::string_view name;
   ElfShdr<E> shdr = {};
   i64 shndx = 0;
-  i64 extra_addralign = 1;
+
+  // Some synethetic sections add local symbols to the output.
+  // For example, range extension thunks adds function_name@thunk
+  // symbol for each thunk entry. The following members are used
+  // for such synthesizing symbols.
+  virtual void compute_symtab_size(Context<E> &ctx) {};
+  virtual void populate_symtab(Context<E> &ctx) {};
+
+  i64 local_symtab_idx = 0;
+  i64 num_local_symtab = 0;
+  i64 strtab_size = 0;
+  i64 strtab_offset = 0;
 
 protected:
   Chunk() { shdr.sh_addralign = 1; }
@@ -440,6 +484,9 @@ public:
   void copy_buf(Context<E> &ctx) override;
   void write_to(Context<E> &ctx, u8 *buf) override;
 
+  void compute_symtab_size(Context<E> &ctx) override;
+  void populate_symtab(Context<E> &ctx) override;
+
   std::vector<InputSection<E> *> members;
   u32 idx;
 
@@ -459,17 +506,13 @@ private:
 
 template <typename E>
 struct GotEntry {
-  bool is_rel(Context<E> &ctx) const {
-    return r_type && !is_relr(ctx);
-  }
-
   bool is_relr(Context<E> &ctx) const {
     return r_type == E::R_RELATIVE && ctx.arg.pack_dyn_relocs_relr;
   }
 
   i64 idx = 0;
   u64 val = 0;
-  i64 r_type = 0;
+  i64 r_type = R_NONE;
   Symbol<E> *sym = nullptr;
 };
 
@@ -481,6 +524,11 @@ public:
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
+
+    // We always create a .got so that _GLOBAL_OFFSET_TABLE_ has
+    // something to point to. s390x psABI defines GOT[1] as a
+    // reserved slot, so we allocate one more on s390x.
+    this->shdr.sh_size = (is_s390x<E> ? 2 : 1) * sizeof(Word<E>);
   }
 
   void add_got_symbol(Context<E> &ctx, Symbol<E> *sym);
@@ -490,8 +538,12 @@ public:
   void add_tlsld(Context<E> &ctx);
 
   u64 get_tlsld_addr(Context<E> &ctx) const;
+  bool has_tlsld(Context<E> &ctx) const { return tlsld_idx != -1; }
   i64 get_reldyn_size(Context<E> &ctx) const;
   void copy_buf(Context<E> &ctx) override;
+
+  void compute_symtab_size(Context<E> &ctx) override;
+  void populate_symtab(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> got_syms;
   std::vector<Symbol<E> *> gottp_syms;
@@ -511,13 +563,20 @@ class GotPltSection : public Chunk<E> {
 public:
   GotPltSection() {
     this->name = ".got.plt";
-    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_type = is_ppc<E> ? SHT_NOBITS : SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
-    this->shdr.sh_size = sizeof(Word<E>) * 3;
+    this->shdr.sh_size = HDR_SIZE;
   }
 
+  void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
+
+  static constexpr i64 HDR_SIZE =
+    (std::is_same_v<E, PPC64V2> ? 2 : 3) * sizeof(Word<E>);
+
+  static constexpr i64 ENTRY_SIZE =
+    (std::is_same_v<E, PPC64V1> ? 3 : 1) * sizeof(Word<E>);
 };
 
 template <typename E>
@@ -526,12 +585,22 @@ public:
   PltSection() {
     this->name = ".plt";
     this->shdr.sh_type = SHT_PROGBITS;
-    this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
-    this->shdr.sh_addralign = 16;
+
+    if constexpr (is_sparc<E>) {
+      this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR | SHF_WRITE;
+      this->shdr.sh_addralign = 256;
+    } else {
+      this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+      this->shdr.sh_addralign = 16;
+    }
   }
 
   void add_symbol(Context<E> &ctx, Symbol<E> *sym);
+  void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
+
+  void compute_symtab_size(Context<E> &ctx) override;
+  void populate_symtab(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> symbols;
 };
@@ -543,11 +612,14 @@ public:
     this->name = ".plt.got";
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
-    this->shdr.sh_addralign = E::pltgot_size;
+    this->shdr.sh_addralign = 16;
   }
 
   void add_symbol(Context<E> &ctx, Symbol<E> *sym);
   void copy_buf(Context<E> &ctx) override;
+
+  void compute_symtab_size(Context<E> &ctx) override;
+  void populate_symtab(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> symbols;
 };
@@ -821,7 +893,7 @@ public:
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
 
-  std::vector<u16> contents;
+  std::vector<U16<E>> contents;
 };
 
 template <typename E>
@@ -928,12 +1000,12 @@ public:
 
 private:
   struct SectionHeader {
-    u32 version = 7;
-    u32 cu_list_offset = 0;
-    u32 cu_types_offset = 0;
-    u32 areas_offset = 0;
-    u32 symtab_offset = 0;
-    u32 const_pool_offset = 0;
+    ul32 version = 7;
+    ul32 cu_list_offset = 0;
+    ul32 cu_types_offset = 0;
+    ul32 areas_offset = 0;
+    ul32 symtab_offset = 0;
+    ul32 const_pool_offset = 0;
   };
 
   struct MapEntry {
@@ -956,29 +1028,15 @@ private:
 };
 
 template <typename E>
-class GabiCompressedSection : public Chunk<E> {
+class CompressedSection : public Chunk<E> {
 public:
-  GabiCompressedSection(Context<E> &ctx, Chunk<E> &chunk);
+  CompressedSection(Context<E> &ctx, Chunk<E> &chunk);
   void copy_buf(Context<E> &ctx) override;
   u8 *get_uncompressed_data() override { return uncompressed.get(); }
 
 private:
   ElfChdr<E> chdr = {};
-  std::unique_ptr<ZlibCompressor> compressed;
-  std::unique_ptr<u8[]> uncompressed;
-};
-
-template <typename E>
-class GnuCompressedSection : public Chunk<E> {
-public:
-  GnuCompressedSection(Context<E> &ctx, Chunk<E> &chunk);
-  void copy_buf(Context<E> &ctx) override;
-  u8 *get_uncompressed_data() override { return uncompressed.get(); }
-
-private:
-  static constexpr i64 HEADER_SIZE = 12;
-  i64 original_size = 0;
-  std::unique_ptr<ZlibCompressor> compressed;
+  std::unique_ptr<Compressor> compressed;
   std::unique_ptr<u8[]> uncompressed;
 };
 
@@ -990,14 +1048,28 @@ public:
   void copy_buf(Context<E> &ctx) override;
 
 private:
-  using RelaTy =
-    typename std::conditional<sizeof(Word<E>) == 8, Elf64Rela, Elf32Rela>::type;
+  using RelaTy = std::conditional_t<E::is_le,
+    std::conditional_t<E::is_64, EL64Rela, EL32Rela>,
+    std::conditional_t<E::is_64, EB64Rela, EB32Rela>>;
 
   OutputSection<E> &output_section;
   std::vector<i64> offsets;
 };
 
-bool is_c_identifier(std::string_view name);
+// PT_GNU_RELRO works on page granularity. We want to align its end to
+// a page boundary. We append this section at end of a segment so that
+// the segment always ends at a page boundary.
+template <typename E>
+class RelroPaddingSection : public Chunk<E> {
+public:
+  RelroPaddingSection() {
+    this->name = ".relro_padding";
+    this->shdr.sh_type = SHT_NOBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
+    this->shdr.sh_addralign = 1;
+    this->shdr.sh_size = 1;
+  }
+};
 
 //
 // dwarf.cc
@@ -1043,6 +1115,8 @@ struct ComdatGroup {
 
 template <typename E>
 struct MergeableSection {
+  std::pair<SectionFragment<E> *, i64> get_fragment(i64 offset);
+
   MergedSection<E> *parent;
   u8 p2align = 0;
   std::vector<std::string_view> strings;
@@ -1095,7 +1169,6 @@ public:
   u32 priority;
   std::atomic_bool is_alive = false;
   std::string_view shstrtab;
-  std::unique_ptr<Symbol<E>[]> local_syms;
   std::string_view symbol_strtab;
 
   // To create an output .symtab
@@ -1108,6 +1181,10 @@ public:
 
   // For --emit-relocs
   std::vector<i32> output_sym_indices;
+
+protected:
+  std::vector<Symbol<E>> local_syms;
+  std::vector<Symbol<E>> frag_syms;
 };
 
 // ObjectFile represents an input .o file.
@@ -1131,7 +1208,7 @@ public:
   void claim_unresolved_symbols(Context<E> &ctx);
   void scan_relocations(Context<E> &ctx);
   void convert_common_symbols(Context<E> &ctx);
-  void compute_symtab(Context<E> &ctx);
+  void compute_symtab_size(Context<E> &ctx);
   void populate_symtab(Context<E> &ctx);
 
   i64 get_shndx(const ElfSym<E> &esym);
@@ -1145,8 +1222,7 @@ public:
   std::vector<CieRecord<E>> cies;
   std::vector<FdeRecord<E>> fdes;
   std::vector<const char *> symvers;
-  std::vector<SectionFragmentRef<E>> sym_fragments;
-  std::vector<std::pair<ComdatGroup *, std::span<ul32>>> comdat_groups;
+  std::vector<std::pair<ComdatGroup *, std::span<U32<E>>>> comdat_groups;
   bool exclude_libs = false;
   u32 features = 0;
   bool is_lto_obj = false;
@@ -1160,7 +1236,7 @@ public:
   u64 fde_size = 0;
 
   // For ICF
-  InputSection<E> *llvm_addrsig = nullptr;
+  std::unique_ptr<InputSection<E>> llvm_addrsig;
 
   // For .gdb_index
   InputSection<E> *debug_info = nullptr;
@@ -1196,7 +1272,7 @@ private:
   bool has_common_symbol = false;
 
   const ElfShdr<E> *symtab_sec;
-  std::span<u32> symtab_shndx_sec;
+  std::span<U32<E>> symtab_shndx_sec;
 };
 
 // SharedFile represents an input .so file.
@@ -1213,7 +1289,7 @@ public:
   void mark_live_objects(Context<E> &ctx,
                          std::function<void(InputFile<E> *)> feeder) override;
 
-  void compute_symtab(Context<E> &ctx);
+  void compute_symtab_size(Context<E> &ctx);
   void populate_symtab(Context<E> &ctx);
 
   bool is_needed = false;
@@ -1333,17 +1409,18 @@ template <typename E> void shuffle_sections(Context<E> &);
 template <typename E> std::vector<Chunk<E> *>
 collect_output_sections(Context<E> &);
 template <typename E> void compute_section_sizes(Context<E> &);
+template <typename E> void sort_output_sections(Context<E> &);
 template <typename E> void claim_unresolved_symbols(Context<E> &);
-template <typename E> void scan_rels(Context<E> &);
+template <typename E> void scan_relocations(Context<E> &);
 template <typename E> void construct_relr(Context<E> &);
 template <typename E> void create_output_symtab(Context<E> &);
 template <typename E> void create_reloc_sections(Context<E> &);
+template <typename E> void copy_chunks(Context<E> &);
 template <typename E> void apply_version_script(Context<E> &);
 template <typename E> void parse_symbol_version(Context<E> &);
 template <typename E> void compute_import_export(Context<E> &);
 template <typename E> void mark_addrsig(Context<E> &);
 template <typename E> void clear_padding(Context<E> &);
-template <typename E> i64 get_section_rank(Context<E> &, Chunk<E> *chunk);
 template <typename E> i64 set_osec_offsets(Context<E> &);
 template <typename E> void fix_synthetic_symbols(Context<E> &);
 template <typename E> i64 compress_debug_sections(Context<E> &);
@@ -1353,44 +1430,7 @@ template <typename E> void write_dependency_file(Context<E> &);
 // arch-arm32.cc
 //
 
-class ThumbToArmSection : public Chunk<ARM32> {
-public:
-  ThumbToArmSection() {
-    this->name = ".thumb_to_arm";
-    this->shdr.sh_type = SHT_PROGBITS;
-    this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
-    this->shdr.sh_addralign = 4;
-  }
-
-  void add_symbol(Context<ARM32> &ctx, Symbol<ARM32> *sym);
-  void update_shdr(Context<ARM32> &ctx) override;
-  void copy_buf(Context<ARM32> &ctx) override;
-
-  std::vector<Symbol<ARM32> *> symbols;
-
-  static constexpr i64 ENTRY_SIZE = 12;
-};
-
-class TlsTrampolineSection : public Chunk<ARM32> {
-public:
-  TlsTrampolineSection() {
-    this->name = ".tls_trampoline";
-    this->shdr.sh_type = SHT_PROGBITS;
-    this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
-    this->shdr.sh_addralign = 4;
-    this->shdr.sh_size = 12;
-  }
-
-  void copy_buf(Context<ARM32> &ctx) override;
-};
-
 void sort_arm_exidx(Context<ARM32> &ctx);
-
-//
-// arch-arm64.cc
-//
-
-void create_range_extension_thunks(Context<ARM64> &ctx, OutputSection<ARM64> &osec);
 
 //
 // arch-riscv64.cc
@@ -1398,6 +1438,64 @@ void create_range_extension_thunks(Context<ARM64> &ctx, OutputSection<ARM64> &os
 
 template <typename E>
 i64 riscv_resize_sections(Context<E> &ctx);
+
+//
+// arch-ppc64v1.cc
+//
+
+void ppc64v1_rewrite_opd(Context<PPC64V1> &ctx);
+void ppc64v1_scan_symbols(Context<PPC64V1> &ctx);
+
+class PPC64OpdSection : public Chunk<PPC64V1> {
+public:
+  PPC64OpdSection() {
+    this->name = ".opd";
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
+    this->shdr.sh_addralign = 8;
+  }
+
+  void add_symbol(Context<PPC64V1> &ctx, Symbol<PPC64V1> *sym);
+  void copy_buf(Context<PPC64V1> &ctx) override;
+
+  static constexpr i64 ENTRY_SIZE = sizeof(Word<PPC64V1>) * 3;
+
+  std::vector<Symbol<PPC64V1> *> symbols;
+};
+
+//
+// arch-s390x.cc
+//
+
+class S390XTlsGetOffsetSection : public Chunk<S390X> {
+public:
+  S390XTlsGetOffsetSection() {
+    this->name = ".tls_get_offset";
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+    this->shdr.sh_addralign = 4;
+    this->shdr.sh_size = 28;
+  }
+
+  void copy_buf(Context<S390X> &ctx) override;
+};
+
+//
+// arch-sparc.cc
+//
+
+class SparcTlsGetAddrSection : public Chunk<SPARC64> {
+public:
+  SparcTlsGetAddrSection() {
+    this->name = ".tls_get_addr";
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+    this->shdr.sh_addralign = 4;
+    this->shdr.sh_size = 24;
+  }
+
+  void copy_buf(Context<SPARC64> &ctx) override;
+};
 
 //
 // main.cc
@@ -1411,7 +1509,7 @@ struct BuildId {
   i64 hash_size = 0;
 };
 
-typedef enum { COMPRESS_NONE, COMPRESS_GABI, COMPRESS_GNU } CompressKind;
+typedef enum { COMPRESS_NONE, COMPRESS_ZLIB, COMPRESS_ZSTD } CompressKind;
 
 typedef enum {
   UNRESOLVED_ERROR,
@@ -1464,7 +1562,7 @@ struct Context {
     BuildId build_id;
     CetReportKind z_cet_report = CET_REPORT_NONE;
     CompressKind compress_debug_sections = COMPRESS_NONE;
-    SeparateCodeKind z_separate_code = SEPARATE_LOADABLE_SEGMENTS;
+    SeparateCodeKind z_separate_code = NOSEPARATE_CODE;
     ShuffleSectionsKind shuffle_sections = SHUFFLE_SECTIONS_NONE;
     UnresolvedKind unresolved_symbols = UNRESOLVED_ERROR;
     bool Bsymbolic = false;
@@ -1477,6 +1575,7 @@ struct Context {
     bool discard_locals = false;
     bool eh_frame_hdr = true;
     bool emit_relocs = false;
+    bool apply_dynamic_relocs = true;
     bool enable_new_dtags = true;
     bool export_dynamic = false;
     bool fatal_warnings = false;
@@ -1570,7 +1669,7 @@ struct Context {
 
   std::vector<VersionPattern> version_patterns;
   u16 default_version = VER_NDX_GLOBAL;
-  bool version_specified = false;
+  bool default_version_from_version_script = false; // true if default_version is set by a wildcard in version script.
   i64 page_size = -1;
 
   // Reader context
@@ -1656,8 +1755,14 @@ struct Context {
   NotePackageSection<E> *note_package = nullptr;
   NotePropertySection<E> *note_property = nullptr;
   GdbIndexSection<E> *gdb_index = nullptr;
-  ThumbToArmSection *thumb_to_arm = nullptr;
-  TlsTrampolineSection *tls_trampoline = nullptr;
+  RelroPaddingSection<E> *relro_padding = nullptr;
+  PPC64OpdSection *ppc64_opd = nullptr;
+  SparcTlsGetAddrSection *sparc_tls_get_addr = nullptr;
+  S390XTlsGetOffsetSection *s390x_tls_get_offset = nullptr;
+
+  // Frequently accessed symbols
+  Symbol<E> *tls_get_addr = nullptr;
+  Symbol<E> *tls_get_offset = nullptr;
 
   // For --gdb-index
   Chunk<E> *debug_info = nullptr;
@@ -1675,12 +1780,13 @@ struct Context {
   RSymtabSection<E> *r_symtab = nullptr;
 
   u64 tls_begin = 0;
-  u64 tls_end = 0;
-  bool relax_tlsdesc = false;
+  u64 tp_addr = 0;
 
   // Linker-synthesized symbols
+  Symbol<E> *TOC = nullptr;
   Symbol<E> *_DYNAMIC = nullptr;
   Symbol<E> *_GLOBAL_OFFSET_TABLE_ = nullptr;
+  Symbol<E> *_PROCEDURE_LINKAGE_TABLE_ = nullptr;
   Symbol<E> *_TLS_MODULE_BASE_ = nullptr;
   Symbol<E> *__GNU_EH_FRAME_HDR = nullptr;
   Symbol<E> *__bss_start = nullptr;
@@ -1715,6 +1821,9 @@ MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string path);
 template <typename E>
 void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf);
 
+template <typename E>
+int elf_main(int argc, char **argv);
+
 int main(int argc, char **argv);
 
 template <typename E>
@@ -1725,34 +1834,31 @@ std::ostream &operator<<(std::ostream &out, const InputFile<E> &file);
 //
 
 enum {
-  NEEDS_GOT                = 1 << 0,
-  NEEDS_PLT                = 1 << 1,
-  NEEDS_CPLT               = 1 << 2,
-  NEEDS_GOTTP              = 1 << 3,
-  NEEDS_TLSGD              = 1 << 4,
-  NEEDS_COPYREL            = 1 << 5,
-  NEEDS_TLSDESC            = 1 << 6,
-  NEEDS_THUMB_TO_ARM_THUNK = 1 << 7,
-
-  // This is used only by ARM64. Since the flag is used in a different
-  // phase than the above flags, we can reuse the same value.
-  NEEDS_RANGE_EXTN_THUNK   = 1 << 0,
+  NEEDS_GOT     = 1 << 0,
+  NEEDS_PLT     = 1 << 1,
+  NEEDS_CPLT    = 1 << 2,
+  NEEDS_GOTTP   = 1 << 3,
+  NEEDS_TLSGD   = 1 << 4,
+  NEEDS_COPYREL = 1 << 5,
+  NEEDS_TLSDESC = 1 << 6,
+  NEEDS_OPD     = 1 << 7,
 };
 
 // A struct to hold taret-dependent symbol members.
 template <typename E>
 struct SymbolExtras {};
 
-template <>
-struct SymbolExtras<ARM32> {
-  i32 thumb_to_arm_thunk_idx = -1;
-};
-
-template <>
-struct SymbolExtras<ARM64> {
+template <typename E> requires needs_thunk<E>
+struct SymbolExtras<E> {
   // For range extension thunks
   i32 thunk_idx = -1;
   i32 thunk_sym_idx = -1;
+};
+
+// Flags for Symbol<E>::get_addr()
+enum {
+  NO_PLT = 1 << 0, // Request an address other than .plt
+  NO_OPD = 1 << 1, // Request an address other than .opd (PPC64V1 only)
 };
 
 // Symbol class represents a defined symbol.
@@ -1767,51 +1873,85 @@ public:
   Symbol(std::string_view name) : nameptr(name.data()), namelen(name.size()) {}
   Symbol(const Symbol<E> &other) : Symbol(other.name()) {}
 
-  u64 get_addr(Context<E> &ctx, bool allow_plt = true) const;
+  u64 get_addr(Context<E> &ctx, i64 flags = 0) const;
   u64 get_got_addr(Context<E> &ctx) const;
   u64 get_gotplt_addr(Context<E> &ctx) const;
   u64 get_gottp_addr(Context<E> &ctx) const;
   u64 get_tlsgd_addr(Context<E> &ctx) const;
   u64 get_tlsdesc_addr(Context<E> &ctx) const;
   u64 get_plt_addr(Context<E> &ctx) const;
+  u64 get_opd_addr(Context<E> &ctx) const;
 
   void set_got_idx(Context<E> &ctx, i32 idx);
-  void set_gotplt_idx(Context<E> &ctx, i32 idx);
   void set_gottp_idx(Context<E> &ctx, i32 idx);
   void set_tlsgd_idx(Context<E> &ctx, i32 idx);
   void set_tlsdesc_idx(Context<E> &ctx, i32 idx);
   void set_plt_idx(Context<E> &ctx, i32 idx);
   void set_pltgot_idx(Context<E> &ctx, i32 idx);
+  void set_opd_idx(Context<E> &ctx, i32 idx);
   void set_dynsym_idx(Context<E> &ctx, i32 idx);
 
   i32 get_got_idx(Context<E> &ctx) const;
-  i32 get_gotplt_idx(Context<E> &ctx) const;
   i32 get_gottp_idx(Context<E> &ctx) const;
   i32 get_tlsgd_idx(Context<E> &ctx) const;
   i32 get_tlsdesc_idx(Context<E> &ctx) const;
   i32 get_plt_idx(Context<E> &ctx) const;
   i32 get_pltgot_idx(Context<E> &ctx) const;
+  i32 get_opd_idx(Context<E> &ctx) const;
   i32 get_dynsym_idx(Context<E> &ctx) const;
 
   bool has_plt(Context<E> &ctx) const;
-  bool has_got(Context<E> &ctx) const;
+  bool has_got(Context<E> &ctx) const { return get_got_idx(ctx) != -1; }
+  bool has_gottp(Context<E> &ctx) const { return get_gottp_idx(ctx) != -1; }
+  bool has_tlsgd(Context<E> &ctx) const { return get_tlsgd_idx(ctx) != -1; }
+  bool has_tlsdesc(Context<E> &ctx) const { return get_tlsdesc_idx(ctx) != -1; }
+  bool has_opd(Context<E> &ctx) const { return get_opd_idx(ctx) != -1; }
 
   bool is_absolute() const;
   bool is_relative() const { return !is_absolute(); }
-  bool is_local() const;
+  bool is_local() const { return !is_imported && !is_exported; }
+  bool is_ifunc() const { return get_type() == STT_GNU_IFUNC; }
+  bool is_remaining_undef_weak() const;
 
   InputSection<E> *get_input_section() const;
+  Chunk<E> *get_output_section() const;
+  SectionFragment<E> *get_frag() const;
+
+  void set_input_section(InputSection<E> *);
+  void set_output_section(Chunk<E> *);
+  void set_frag(SectionFragment<E> *);
+
+  void set_name(std::string_view);
+  std::string_view name() const;
+
   u32 get_type() const;
   std::string_view get_version() const;
   const ElfSym<E> &esym() const;
-  SectionFragment<E> *get_frag() const;
-  std::string_view name() const;
+  void clear();
 
   // A symbol is owned by a file. If two or more files define the
   // same symbol, the one with the strongest definition owns the symbol.
   // If `file` is null, the symbol is equivalent to nonexistent.
   InputFile<E> *file = nullptr;
 
+  // A symbol usually belongs to an input section, but it can belong
+  // to a section fragment, an output section or nothing
+  // (i.e. absolute symbol). `origin` holds one of them. We use the
+  // least significant two bits to distinguish type.
+  enum : uintptr_t {
+    TAG_ABS  = 0b00,
+    TAG_ISEC = 0b01,
+    TAG_OSEC = 0b10,
+    TAG_FRAG = 0b11,
+    TAG_MASK = 0b11,
+  };
+
+  uintptr_t origin = 0;
+
+  // `value` contains symbol value. If it's an absolute symbol, it is
+  // equivalent to its address. If it belongs to an input section or a
+  // section fragment, value is added to the base of the input section
+  // to yield an address.
   u64 value = 0;
 
   const char *nameptr = nullptr;
@@ -1819,11 +1959,6 @@ public:
 
   // Index into the symbol table of the owner file.
   i32 sym_idx = -1;
-
-  // shndx > 0  : symbol is in file's shndx'th section
-  // shndx == 0 : absolute symbol
-  // shndx < 0  : symbol is in the -shndx'th output section
-  i32 shndx = 0;
 
   i32 aux_idx = -1;
   u16 ver_idx = 0;
@@ -1864,7 +1999,7 @@ public:
   bool is_exported : 1 = false;
 
   // `is_canonical` is true if this symbol represents a "canonical" PLT.
-  // Here is the explanation as to what is the canonical PLT is.
+  // Here is the explanation as to what the canonical PLT is.
   //
   // In C/C++, the process-wide function pointer equality is guaratneed.
   // That is, if you take an address of a function `foo`, it's always
@@ -1928,8 +2063,8 @@ public:
   // The loader supports a feature so-called "copy relocations".
   // A copy relocation instructs the loader to copy data from a DSO to a
   // specified location in the main executable. By using this feature,
-  // you can make `foo`'s data to a BSS region at runtime. With that,
-  // you can apply relocations agianst `foo` as if `foo` existed in the
+  // we can copy `foo`'s data to a BSS region at runtime. With that,
+  // we can apply relocations agianst `foo` as if `foo` existed in the
   // main executable's BSS area, whose address is known at link-time.
   //
   // Copy relocations are used only by position-dependent executables.
@@ -1982,7 +2117,7 @@ std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym) {
 
 template <typename E>
 inline i64 FdeRecord<E>::size(ObjectFile<E> &file) const {
-  return *(ul32 *)(file.cies[cie_idx].contents.data() + input_offset) + 4;
+  return *(U32<E> *)(file.cies[cie_idx].contents.data() + input_offset) + 4;
 }
 
 template <typename E>
@@ -2037,15 +2172,15 @@ inline i64 InputSection<E>::get_priority() const {
 }
 
 template <typename E>
-inline i64 InputSection<E>::get_addend(const ElfRel<E> &rel) const {
-  return rel.r_addend;
+inline i64 InputSection<E>::get_addend(const ElfRel<E> &r) const {
+  return r.r_addend;
 }
 
 template <>
-inline i64 InputSection<I386>::get_addend(const ElfRel<I386> &rel) const {
-  u8 *loc = (u8 *)contents.data() + rel.r_offset;
+inline i64 InputSection<I386>::get_addend(const ElfRel<I386> &r) const {
+  u8 *loc = (u8 *)contents.data() + r.r_offset;
 
-  switch (rel.r_type) {
+  switch (r.r_type) {
   case R_386_NONE:
     return 0;
   case R_386_8:
@@ -2075,10 +2210,10 @@ inline i64 InputSection<I386>::get_addend(const ElfRel<I386> &rel) const {
 }
 
 template <>
-inline i64 InputSection<ARM32>::get_addend(const ElfRel<ARM32> &rel) const {
-  u8 *loc = (u8 *)contents.data() + rel.r_offset;
+inline i64 InputSection<ARM32>::get_addend(const ElfRel<ARM32> &r) const {
+  u8 *loc = (u8 *)contents.data() + r.r_offset;
 
-  switch (rel.r_type) {
+  switch (r.r_type) {
   case R_ARM_NONE:
     return 0;
   case R_ARM_ABS32:
@@ -2167,22 +2302,12 @@ InputSection<E>::get_fragment(Context<E> &ctx, const ElfRel<E> &rel) {
   assert(!(shdr().sh_flags & SHF_ALLOC));
 
   const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
-  if (esym.st_type != STT_SECTION)
-    return {nullptr, 0};
+  if (esym.st_type == STT_SECTION)
+    if (std::unique_ptr<MergeableSection<E>> &m =
+        file.mergeable_sections[file.get_shndx(esym)])
+      return m->get_fragment(esym.st_value + get_addend(rel));
 
-  std::unique_ptr<MergeableSection<E>> &m =
-    file.mergeable_sections[file.get_shndx(esym)];
-  if (!m)
-    return {nullptr, 0};
-
-  i64 offset = esym.st_value + get_addend(rel);
-  std::span<u32> offsets = m->frag_offsets;
-
-  auto it = std::upper_bound(offsets.begin(), offsets.end(), offset);
-  if (it == offsets.begin())
-    Fatal(ctx) << *this << ": bad relocation at " << rel.r_sym;
-  i64 idx = it - 1 - offsets.begin();
-  return {m->fragments[idx], offset - offsets[idx]};
+  return {nullptr, 0};
 }
 
 // Input object files may contain duplicate code for inline functions
@@ -2196,7 +2321,11 @@ InputSection<E>::get_fragment(Context<E> &ctx, const ElfRel<E> &rel) {
 // This function returns a tombstone value for the symbol if the symbol
 // refers a dead debug info section.
 template <typename E>
-inline std::optional<u64> InputSection<E>::get_tombstone(Symbol<E> &sym) {
+inline std::optional<u64>
+InputSection<E>::get_tombstone(Symbol<E> &sym, SectionFragment<E> *frag) {
+  if (frag)
+    return {};
+
   InputSection<E> *isec = sym.get_input_section();
 
   // Setting a tombstone is a special feature for a dead debug section.
@@ -2210,7 +2339,7 @@ inline std::optional<u64> InputSection<E>::get_tombstone(Symbol<E> &sym) {
   // If the section was dead due to ICF, we don't want to emit debug
   // info for that section but want to set real values to .debug_line so
   // that users can set a breakpoint inside a merged section.
-  if (isec->killed_by_icf && s == ".debug_line")
+  if (isec->is_killed_by_icf() && s == ".debug_line")
     return {};
 
   // 0 is an invalid value in most debug info sections, so we use it
@@ -2227,14 +2356,27 @@ inline bool InputSection<E>::is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel
          (rel.r_offset % sizeof(Word<E>)) == 0;
 }
 
-inline u64
-RangeExtensionThunk<ARM64>::get_addr(i64 idx) const {
-  return output_section.shdr.sh_addr + offset + idx * ENTRY_SIZE;
+template<typename E>
+inline bool InputSection<E>::is_killed_by_icf() const {
+  return this->leader && this->leader != this;
+}
+
+template <typename E>
+std::pair<SectionFragment<E> *, i64>
+MergeableSection<E>::get_fragment(i64 offset) {
+  std::vector<u32> &vec = frag_offsets;
+  auto it = std::upper_bound(vec.begin(), vec.end(), offset);
+  if (it == vec.begin())
+    return {nullptr, 0};
+
+  i64 idx = it - 1 - vec.begin();
+  return {fragments[idx], offset - vec[idx]};
 }
 
 template <typename E>
 template <typename T>
-inline std::span<T> InputFile<E>::get_data(Context<E> &ctx, const ElfShdr<E> &shdr) {
+inline std::span<T>
+InputFile<E>::get_data(Context<E> &ctx, const ElfShdr<E> &shdr) {
   std::string_view view = this->get_string(ctx, shdr);
   if (view.size() % sizeof(T))
     Fatal(ctx) << *this << ": corrupted section";
@@ -2289,21 +2431,17 @@ inline InputSection<E> *ObjectFile<E>::get_section(const ElfSym<E> &esym) {
 }
 
 template <typename E>
-inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
-  if (file && !file->is_dso) {
-    SectionFragmentRef<E> &ref = ((ObjectFile<E> *)file)->sym_fragments[sym_idx];
-
-    if (ref.frag) {
-      if (!ref.frag->is_alive) {
-        // This condition is met if a non-alloc section refers an
-        // alloc section and if the referenced piece of data is
-        // garbage-collected. Typically, this condition occurs if a
-        // debug info section refers a string constant in .rodata.
-        return 0;
-      }
-
-      return ref.frag->get_addr(ctx) + ref.addend;
+inline u64 Symbol<E>::get_addr(Context<E> &ctx, i64 flags) const {
+  if (SectionFragment<E> *frag = get_frag()) {
+    if (!frag->is_alive) {
+      // This condition is met if a non-alloc section refers an
+      // alloc section and if the referenced piece of data is
+      // garbage-collected. Typically, this condition occurs if a
+      // debug info section refers a string constant in .rodata.
+      return 0;
     }
+
+    return frag->get_addr(ctx) + value;
   }
 
   if (has_copyrel) {
@@ -2312,8 +2450,12 @@ inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
       : ctx.copyrel->shdr.sh_addr + value;
   }
 
-  if (allow_plt && has_plt(ctx)) {
-    assert(is_imported || esym().st_type == STT_GNU_IFUNC);
+  if constexpr (std::is_same_v<E, PPC64V1>)
+    if (!(flags & NO_OPD) && has_opd(ctx))
+      return get_opd_addr(ctx);
+
+  if (!(flags & NO_PLT) && has_plt(ctx)) {
+    assert(is_imported || is_ifunc());
     return get_plt_addr(ctx);
   }
 
@@ -2322,7 +2464,7 @@ inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
     return value; // absolute symbol
 
   if (!isec->is_alive) {
-    if (isec->killed_by_icf)
+    if (isec->is_killed_by_icf())
       return isec->leader->get_addr() + value;
 
     if (isec->name() == ".eh_frame") {
@@ -2331,7 +2473,7 @@ inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
       // section doesn't make much sense. However, CRT files contain
       // symbols pointing to the very beginning and ending of the section.
       if (name() == "__EH_FRAME_BEGIN__" || name() == "__EH_FRAME_LIST__" ||
-          esym().st_type == STT_SECTION)
+          name() == ".eh_frame_seg" || esym().st_type == STT_SECTION)
         return ctx.eh_frame->shdr.sh_addr;
 
       if (name() == "__FRAME_END__" || name() == "__EH_FRAME_LIST_END__")
@@ -2365,8 +2507,9 @@ inline u64 Symbol<E>::get_got_addr(Context<E> &ctx) const {
 
 template <typename E>
 inline u64 Symbol<E>::get_gotplt_addr(Context<E> &ctx) const {
-  assert(get_gotplt_idx(ctx) != -1);
-  return ctx.gotplt->shdr.sh_addr + get_gotplt_idx(ctx) * sizeof(Word<E>);
+  assert(get_plt_idx(ctx) != -1);
+  return ctx.gotplt->shdr.sh_addr + GotPltSection<E>::HDR_SIZE +
+         get_plt_idx(ctx) * GotPltSection<E>::ENTRY_SIZE;
 }
 
 template <typename E>
@@ -2395,17 +2538,17 @@ inline u64 Symbol<E>::get_plt_addr(Context<E> &ctx) const {
 }
 
 template <typename E>
+inline u64 Symbol<E>::get_opd_addr(Context<E> &ctx) const {
+  assert(get_opd_idx(ctx) != -1);
+  return ctx.ppc64_opd->shdr.sh_addr +
+         get_opd_idx(ctx) * PPC64OpdSection::ENTRY_SIZE;
+}
+
+template <typename E>
 inline void Symbol<E>::set_got_idx(Context<E> &ctx, i32 idx) {
   assert(aux_idx != -1);
   assert(ctx.symbol_aux[aux_idx].got_idx < 0);
   ctx.symbol_aux[aux_idx].got_idx = idx;
-}
-
-template <typename E>
-inline void Symbol<E>::set_gotplt_idx(Context<E> &ctx, i32 idx) {
-  assert(aux_idx != -1);
-  assert(ctx.symbol_aux[aux_idx].gotplt_idx < 0);
-  ctx.symbol_aux[aux_idx].gotplt_idx = idx;
 }
 
 template <typename E>
@@ -2444,6 +2587,13 @@ inline void Symbol<E>::set_pltgot_idx(Context<E> &ctx, i32 idx) {
 }
 
 template <typename E>
+inline void Symbol<E>::set_opd_idx(Context<E> &ctx, i32 idx) {
+  assert(aux_idx != -1);
+  assert(ctx.symbol_aux[aux_idx].opd_idx < 0);
+  ctx.symbol_aux[aux_idx].opd_idx = idx;
+}
+
+template <typename E>
 inline void Symbol<E>::set_dynsym_idx(Context<E> &ctx, i32 idx) {
   assert(aux_idx != -1);
   assert(ctx.symbol_aux[aux_idx].dynsym_idx < 0);
@@ -2453,11 +2603,6 @@ inline void Symbol<E>::set_dynsym_idx(Context<E> &ctx, i32 idx) {
 template <typename E>
 inline i32 Symbol<E>::get_got_idx(Context<E> &ctx) const {
   return (aux_idx == -1) ? -1 : ctx.symbol_aux[aux_idx].got_idx;
-}
-
-template <typename E>
-inline i32 Symbol<E>::get_gotplt_idx(Context<E> &ctx) const {
-  return (aux_idx == -1) ? -1 : ctx.symbol_aux[aux_idx].gotplt_idx;
 }
 
 template <typename E>
@@ -2486,6 +2631,11 @@ inline i32 Symbol<E>::get_pltgot_idx(Context<E> &ctx) const {
 }
 
 template <typename E>
+inline i32 Symbol<E>::get_opd_idx(Context<E> &ctx) const {
+  return (aux_idx == -1) ? -1 : ctx.symbol_aux[aux_idx].opd_idx;
+}
+
+template <typename E>
 inline i32 Symbol<E>::get_dynsym_idx(Context<E> &ctx) const {
   return (aux_idx == -1) ? -1 : ctx.symbol_aux[aux_idx].dynsym_idx;
 }
@@ -2496,29 +2646,62 @@ inline bool Symbol<E>::has_plt(Context<E> &ctx) const {
 }
 
 template <typename E>
-inline bool Symbol<E>::has_got(Context<E> &ctx) const {
-  return get_got_idx(ctx) != -1;
-}
-
-template <typename E>
 inline bool Symbol<E>::is_absolute() const {
   if (file && file->is_dso)
     return esym().is_abs();
-  return !is_imported && !get_frag() && shndx == 0;
+
+  return !is_imported && !get_frag() && !get_input_section() &&
+         !get_output_section();
 }
 
+// A remaining weak undefined symbol is promoted to a dynamic symbol
+// in DSO and resolved to 0 in an executable. This function returns
+// true if it's latter.
 template<typename E>
-inline bool Symbol<E>::is_local() const {
-  return !is_imported && !is_exported;
+inline bool Symbol<E>::is_remaining_undef_weak() const {
+  return !is_imported && esym().is_undef_weak();
 }
 
 template <typename E>
 inline InputSection<E> *Symbol<E>::get_input_section() const {
-  if (shndx > 0) {
-    assert(!file->is_dso);
-    return ((ObjectFile<E> *)file)->sections[shndx].get();
-  }
+  if ((origin & TAG_MASK) == TAG_ISEC)
+    return (InputSection<E> *)(origin & ~TAG_MASK);
   return nullptr;
+}
+
+template <typename E>
+inline Chunk<E> *Symbol<E>::get_output_section() const {
+  if ((origin & TAG_MASK) == TAG_OSEC)
+    return (Chunk<E> *)(origin & ~TAG_MASK);
+  return nullptr;
+}
+
+template <typename E>
+inline SectionFragment<E> *Symbol<E>::get_frag() const {
+  if ((origin & TAG_MASK) == TAG_FRAG)
+    return (SectionFragment<E> *)(origin & ~TAG_MASK);
+  return nullptr;
+}
+
+template <typename E>
+inline void Symbol<E>::set_input_section(InputSection<E> *isec) {
+  uintptr_t addr = (uintptr_t)isec;
+  assert((addr & TAG_MASK) == 0);
+  origin = addr | TAG_ISEC;
+}
+
+template <typename E>
+inline void Symbol<E>::set_output_section(Chunk<E> *osec) {
+  uintptr_t addr = (uintptr_t)osec;
+  assert((addr & TAG_MASK) == 0);
+  origin = addr | TAG_OSEC;
+}
+
+template <typename E>
+inline void Symbol<E>::set_frag(SectionFragment<E> *frag) {
+  uintptr_t addr = (uintptr_t)frag;
+  assert((addr & TAG_MASK) == 0);
+  origin = addr | TAG_FRAG;
 }
 
 template <typename E>
@@ -2541,15 +2724,67 @@ inline const ElfSym<E> &Symbol<E>::esym() const {
 }
 
 template <typename E>
-inline SectionFragment<E> *Symbol<E>::get_frag() const {
-  if (!file || file->is_dso)
-    return nullptr;
-  return ((ObjectFile<E> *)file)->sym_fragments[sym_idx].frag;
+inline void Symbol<E>::set_name(std::string_view name) {
+  nameptr = name.data();
+  namelen = name.size();
 }
 
 template <typename E>
 inline std::string_view Symbol<E>::name() const {
   return {nameptr, (size_t)namelen};
+}
+
+template <typename E>
+inline void Symbol<E>::clear() {
+  file = nullptr;
+  origin = 0;
+  value = -1;
+  sym_idx = -1;
+  ver_idx = 0;
+  is_weak = false;
+  is_imported = false;
+  is_exported = false;
+}
+
+inline bool is_c_identifier(std::string_view s) {
+  if (s.empty())
+    return false;
+
+  auto is_alpha = [](char c) {
+    return c == '_' || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z');
+  };
+
+  auto is_alnum = [&](char c) {
+    return is_alpha(c) || ('0' <= c && c <= '9');
+  };
+
+  if (!is_alpha(s[0]))
+    return false;
+  for (i64 i = 1; i < s.size(); i++)
+    if (!is_alnum(s[i]))
+      return false;
+  return true;
+}
+
+template <typename E>
+inline bool relax_tlsgd(Context<E> &ctx, Symbol<E> &sym) {
+  return ctx.arg.relax && !ctx.arg.shared && !sym.is_imported;
+}
+
+template <typename E>
+inline bool relax_tlsld(Context<E> &ctx) {
+  return ctx.arg.relax && !ctx.arg.shared;
+}
+
+template <typename E>
+inline bool relax_tlsdesc(Context<E> &ctx, Symbol<E> &sym) {
+  // TLSDESC relocs must be always relaxed for statically-linked
+  // executables even if -no-relax is given. It is because a
+  // statically-linked executable doesn't contain a tranpoline
+  // function needed for TLSDESC.
+  if (ctx.arg.is_static)
+    return true;
+  return ctx.arg.relax && !ctx.arg.shared && !sym.is_imported;
 }
 
 } // namespace mold::elf
