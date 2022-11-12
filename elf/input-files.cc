@@ -1,5 +1,6 @@
 #include "mold.h"
 
+#include <bit>
 #include <cstring>
 
 #ifndef _WIN32
@@ -48,10 +49,19 @@ ElfShdr<E> *InputFile<E>::find_section(i64 type) {
   return nullptr;
 }
 
+// This function is actually racy, in that "tearing" might be observed
+// during the read or write of `sym->file`. However, on most platforms
+// read/write of pointers never tears, and even if it did, it would be
+// harmless, as `sym->file` will not become equal to `sym`, or even if
+// it did by chance, we just wipe a symbol twice.
+//
+// Doing this in a standard-compliant way is too cumbersome, hence
+// here we just pretend a compiler will never optimize this into a
+// form that actually exploits the UB.
 template <typename E>
+__attribute__((no_sanitize("thread")))
 void InputFile<E>::clear_symbols() {
   for (Symbol<E> *sym : get_global_syms()) {
-    std::scoped_lock lock(sym->mu);
     if (sym->file == this)
       sym->clear();
   }
@@ -191,6 +201,12 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
         continue;
       }
 
+      // Ignore a build-id section in an input file. This doesn't normally
+      // happen, but you can create such object file with
+      // `ld.bfd -r --build-id`.
+      if (name == ".note.gnu.build-id")
+        continue;
+
       // Ignore these sections for compatibility with old glibc i386 CRT files.
       if (name == ".gnu.linkonce.t.__x86.get_pc_thunk.bx" ||
           name == ".gnu.linkonce.t.__i686.get_pc_thunk.bx")
@@ -210,6 +226,13 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
         llvm_addrsig = std::make_unique<InputSection<E>>(ctx, *this, name, i);
         continue;
       }
+
+      // If an output file doesn't have a section header (i.e.
+      // --oformat=binary is given), we discard all non-memory-allocated
+      // sections. This is because without a section header, we can't find
+      // their places in an output file in the first place.
+      if (ctx.arg.oformat_binary && !(shdr.sh_flags & SHF_ALLOC))
+        continue;
 
       this->sections[i] = std::make_unique<InputSection<E>>(ctx, *this, name, i);
 
@@ -432,7 +455,7 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
 
     std::string_view name;
     if (esym.st_type == STT_SECTION)
-      name = this->shstrtab.data() + this->elf_sections[esym.st_shndx].sh_name;
+      name = this->shstrtab.data() + this->elf_sections[get_shndx(esym)].sh_name;
     else
       name = this->symbol_strtab.data() + esym.st_name;
 
@@ -508,7 +531,7 @@ static size_t find_null(std::string_view data, u64 entsize) {
     return data.find('\0');
 
   for (i64 i = 0; i <= data.size() - entsize; i += entsize)
-    if (data.substr(i, i + entsize).find_first_not_of('\0') == data.npos)
+    if (data.substr(i, entsize).find_first_not_of('\0') == data.npos)
       return i;
 
   return data.npos;
@@ -780,7 +803,6 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
   initialize_sections(ctx);
   initialize_symbols(ctx);
   sort_relocations(ctx);
-  initialize_mergeable_sections(ctx);
   initialize_ehframe_sections(ctx);
 }
 
@@ -805,22 +827,12 @@ static u64 get_rank(InputFile<E> *file, const ElfSym<E> &esym, bool is_lazy) {
     return (5 << 24) + file->priority;
   }
 
-  // GCC creates symbols in COMDATs with STB_GNU_UNIQUE instead of
-  // STB_WEAK if it was configured to do so at build time or the
-  // -fgnu-unique flag was given. In order to to not select a
-  // GNU_UNIQUE symbol in a discarded COMDAT section, we treat it as
-  // if it were weak.
-  //
-  // It looks like STB_GNU_UNIQUE is not a popular option anymore and
-  // often disabled by default though.
-  bool is_weak = (esym.st_bind == STB_WEAK || esym.st_bind == STB_GNU_UNIQUE);
-
   if (file->is_dso || is_lazy) {
-    if (is_weak)
+    if (esym.st_bind == STB_WEAK)
       return (4 << 24) + file->priority;
     return (3 << 24) + file->priority;
   }
-  if (is_weak)
+  if (esym.st_bind == STB_WEAK)
     return (2 << 24) + file->priority;
   return (1 << 24) + file->priority;
 }
@@ -884,7 +896,7 @@ void ObjectFile<E>::resolve_symbols(Context<E> &ctx) {
     InputSection<E> *isec = nullptr;
     if (!esym.is_abs() && !esym.is_common()) {
       isec = get_section(esym);
-      if (!isec)
+      if (!isec || !isec->is_alive)
         continue;
     }
 
@@ -923,12 +935,11 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
     if (esym.is_weak())
       continue;
 
-    std::scoped_lock lock(sym.mu);
     if (!sym.file)
       continue;
 
     bool keep = esym.is_undef() || (esym.is_common() && !sym.esym().is_common());
-    if (keep && !sym.file->is_alive.exchange(true)) {
+    if (keep && fast_mark(sym.file->is_alive)) {
       feeder(sym.file);
 
       if (sym.traced)
@@ -1192,6 +1203,8 @@ void ObjectFile<E>::compute_symtab_size(Context<E> &ctx) {
   if (ctx.arg.strip_all)
     return;
 
+  this->output_sym_indices.resize(this->elf_syms.size(), -1);
+
   auto is_alive = [&](Symbol<E> &sym) -> bool {
     if (!ctx.arg.gc_sections)
       return true;
@@ -1210,7 +1223,7 @@ void ObjectFile<E>::compute_symtab_size(Context<E> &ctx) {
 
       if (is_alive(sym) && should_write_to_local_symtab(ctx, sym)) {
         this->strtab_size += sym.name().size() + 1;
-        this->num_local_symtab++;
+        this->output_sym_indices[i] = this->num_local_symtab++;
         sym.write_to_symtab = true;
       }
     }
@@ -1226,9 +1239,9 @@ void ObjectFile<E>::compute_symtab_size(Context<E> &ctx) {
       // Global symbols can be demoted to local symbols based on visibility,
       // version scripts etc.
       if (sym.is_local())
-        this->num_local_symtab++;
+        this->output_sym_indices[i] = this->num_local_symtab++;
       else
-        this->num_global_symtab++;
+        this->output_sym_indices[i] = this->num_global_symtab++;
       sym.write_to_symtab = true;
     }
   }
@@ -1242,11 +1255,8 @@ void ObjectFile<E>::populate_symtab(Context<E> &ctx) {
   i64 strtab_off = this->strtab_offset;
 
   auto write_sym = [&](Symbol<E> &sym, i64 &symtab_idx) {
-    ElfSym<E> &esym = symtab_base[symtab_idx++];
-    esym = to_output_esym(ctx, sym);
-    esym.st_name = strtab_off;
-    write_string(strtab_base + strtab_off, sym.name());
-    strtab_off += sym.name().size() + 1;
+    symtab_base[symtab_idx++] = to_output_esym(ctx, sym, strtab_off);
+    strtab_off += write_string(strtab_base + strtab_off, sym.name());
   };
 
   i64 local_symtab_idx = this->local_symtab_idx;
@@ -1452,7 +1462,7 @@ SharedFile<E>::mark_live_objects(Context<E> &ctx,
       print_trace_symbol(ctx, *this, esym, sym);
 
     if (esym.is_undef() && sym.file && !sym.file->is_dso &&
-        !sym.file->is_alive.exchange(true)) {
+        fast_mark(sym.file->is_alive)) {
       feeder(sym.file);
 
       if (sym.traced)
@@ -1473,6 +1483,22 @@ std::vector<Symbol<E> *> SharedFile<E>::find_aliases(Symbol<E> *sym) {
   return vec;
 }
 
+// Infer an alignment of a DSO symbol. An alignment of a symbol in other
+// .so is not something we usually care about, but when we create a copy
+// relocation for a symbol, we need to preserve its alignment requirement.
+//
+// Symbol alignment is not explicitly represented in an ELF file. In this
+// function, we conservatively infer it from a symbol address and a
+// section alignment requirement.
+template <typename E>
+i64 SharedFile<E>::get_alignment(Symbol<E> *sym) {
+  ElfShdr<E> &shdr = this->elf_sections[sym->esym().st_shndx];
+  i64 align = std::max<i64>(1, shdr.sh_addralign);
+  if (sym->value)
+    align = std::min<i64>(align, 1LL << std::countr_zero(sym->value));
+  return align;
+}
+
 template <typename E>
 bool SharedFile<E>::is_readonly(Context<E> &ctx, Symbol<E> *sym) {
   ElfPhdr<E> *phdr = this->get_phdr();
@@ -1490,6 +1516,8 @@ void SharedFile<E>::compute_symtab_size(Context<E> &ctx) {
   if (ctx.arg.strip_all)
     return;
 
+  this->output_sym_indices.resize(this->elf_syms.size(), -1);
+
   // Compute the size of global symbols.
   for (i64 i = this->first_global; i < this->symbols.size(); i++) {
     Symbol<E> &sym = *this->symbols[i];
@@ -1497,7 +1525,7 @@ void SharedFile<E>::compute_symtab_size(Context<E> &ctx) {
     if (sym.file == this && (sym.is_imported || sym.is_exported) &&
         (!ctx.arg.retain_symbols_file || sym.write_to_symtab)) {
       this->strtab_size += sym.name().size() + 1;
-      this->num_global_symtab++;
+      this->output_sym_indices[i] = this->num_global_symtab++;
       sym.write_to_symtab = true;
     }
   }
@@ -1508,24 +1536,16 @@ void SharedFile<E>::populate_symtab(Context<E> &ctx) {
   ElfSym<E> *symtab =
     (ElfSym<E> *)(ctx.buf + ctx.symtab->shdr.sh_offset) + this->global_symtab_idx;
 
-  u8 *strtab = ctx.buf + ctx.strtab->shdr.sh_offset + this->strtab_offset;
+  u8 *strtab = ctx.buf + ctx.strtab->shdr.sh_offset;
+  i64 strtab_off = this->strtab_offset;
 
   for (i64 i = this->first_global; i < this->elf_syms.size(); i++) {
     Symbol<E> &sym = *this->symbols[i];
     if (sym.file != this || !sym.write_to_symtab)
       continue;
 
-    ElfSym<E> &esym = *symtab++;
-    esym.st_name = strtab - (ctx.buf + ctx.strtab->shdr.sh_offset);
-    esym.st_value = 0;
-    esym.st_size = 0;
-    esym.st_type = STT_NOTYPE;
-    esym.st_bind = STB_GLOBAL;
-    esym.st_visibility = sym.visibility;
-    esym.st_shndx = SHN_UNDEF;
-
-    write_string(strtab, sym.name());
-    strtab += sym.name().size() + 1;
+    *symtab++ = to_output_esym(ctx, sym, strtab_off);
+    strtab_off += write_string(strtab + strtab_off, sym.name());
   }
 }
 
