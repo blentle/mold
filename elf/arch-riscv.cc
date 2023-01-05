@@ -309,11 +309,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
                    << lo << ", " << hi << ")";
     };
 
-#define S   sym.get_addr(ctx)
-#define A   rel.r_addend
-#define P   (get_addr() + r_offset)
-#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
-#define GOT ctx.got->shdr.sh_addr
+    u64 S = sym.get_addr(ctx);
+    u64 A = rel.r_addend;
+    u64 P = get_addr() + r_offset;
+    u64 G = sym.get_got_idx(ctx) * sizeof(Word<E>);
+    u64 GOT = ctx.got->shdr.sh_addr;
 
     switch (rel.r_type) {
     case R_RISCV_32:
@@ -509,12 +509,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     default:
       unreachable();
     }
-
-#undef S
-#undef A
-#undef P
-#undef G
-#undef GOT
   }
 
   // Handle PC-relative LO12 relocations. In the above loop, pcrel HI20
@@ -575,8 +569,8 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     i64 frag_addend;
     std::tie(frag, frag_addend) = get_fragment(ctx, rel);
 
-#define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? frag_addend : (i64)rel.r_addend)
+    u64 S = frag ? frag->get_addr(ctx) : sym.get_addr(ctx);
+    u64 A = frag ? frag_addend : (i64)rel.r_addend;
 
     switch (rel.r_type) {
     case R_RISCV_32:
@@ -632,9 +626,6 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
                  << rel;
       break;
     }
-
-#undef S
-#undef A
   }
 }
 
@@ -687,40 +678,40 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     }
 
     if (sym.is_ifunc())
-      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
+      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
 
     switch (rel.r_type) {
     case R_RISCV_32:
       if constexpr (E::is_64)
-        scan_rel(ctx, sym, rel, absrel_table);
+        scan_absrel(ctx, sym, rel);
       else
-        scan_rel(ctx, sym, rel, dyn_absrel_table);
+        scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_RISCV_HI20:
-      scan_rel(ctx, sym, rel, absrel_table);
+      scan_absrel(ctx, sym, rel);
       break;
     case R_RISCV_64:
       if constexpr (!E::is_64)
         Fatal(ctx) << *this << ": R_RISCV_64 cannot be used on RV32";
-      scan_rel(ctx, sym, rel, dyn_absrel_table);
+      scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_RISCV_CALL:
     case R_RISCV_CALL_PLT:
       if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
       break;
     case R_RISCV_GOT_HI20:
-      sym.flags |= NEEDS_GOT;
+      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     case R_RISCV_TLS_GOT_HI20:
-      ctx.has_gottp_rel = true;
-      sym.flags |= NEEDS_GOTTP;
+      ctx.has_gottp_rel.store(true, std::memory_order_relaxed);
+      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
       break;
     case R_RISCV_TLS_GD_HI20:
-      sym.flags |= NEEDS_TLSGD;
+      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
       break;
     case R_RISCV_32_PCREL:
-      scan_rel(ctx, sym, rel, pcrel_table);
+      scan_pcrel(ctx, sym, rel);
       break;
     case R_RISCV_BRANCH:
     case R_RISCV_JAL:

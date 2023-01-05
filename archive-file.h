@@ -20,7 +20,7 @@
 // that provides functions and variables used in your program get
 // linked. To make this efficient, static library functions are
 // usually separated to each object file in an archive file. You can
-// see the contents of libc.a by runnning `ar t
+// see the contents of libc.a by running `ar t
 // /usr/lib/x86_64-linux-gnu/libc.a`.
 
 #pragma once
@@ -166,7 +166,7 @@ read_fat_archive_members(C &ctx, MappedFile<C> *mf) {
 template <typename C>
 std::vector<MappedFile<C> *>
 read_archive_members(C &ctx, MappedFile<C> *mf) {
-  switch (get_file_type(mf)) {
+  switch (get_file_type(mf, !ctx.arg.plugin.empty())) {
   case FileType::AR:
     return read_fat_archive_members(ctx, mf);
   case FileType::THIN_AR:

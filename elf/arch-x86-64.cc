@@ -23,6 +23,7 @@
 // TLS block as TP (with some addend). As a result, offsets from TP to
 // thread-local variables (TLVs) in the main executable are all negative.
 //
+// https://github.com/rui314/mold/wiki/i386-psabi.pdf
 // https://github.com/rui314/mold/wiki/x86-64-psabi.pdf
 
 #include "mold.h"
@@ -223,11 +224,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ul32 *)loc = val;
     };
 
-#define S   sym.get_addr(ctx)
-#define A   rel.r_addend
-#define P   (get_addr() + rel.r_offset)
-#define G   (sym.get_got_addr(ctx) - ctx.gotplt->shdr.sh_addr)
-#define GOT ctx.gotplt->shdr.sh_addr
+    u64 S = sym.get_addr(ctx);
+    u64 A = rel.r_addend;
+    u64 P = get_addr() + rel.r_offset;
+    u64 G = sym.get_got_addr(ctx) - ctx.gotplt->shdr.sh_addr;
+    u64 GOTPLT = ctx.gotplt->shdr.sh_addr;
 
     switch (rel.r_type) {
     case R_X86_64_8: {
@@ -278,23 +279,23 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     case R_X86_64_GOTOFF64:
     case R_X86_64_PLTOFF64:
-      *(ul64 *)loc = S + A - GOT;
+      *(ul64 *)loc = S + A - GOTPLT;
       break;
     case R_X86_64_GOTPC32:
-      write32s(GOT + A - P);
+      write32s(GOTPLT + A - P);
       break;
     case R_X86_64_GOTPC64:
-      *(ul64 *)loc = GOT + A - P;
+      *(ul64 *)loc = GOTPLT + A - P;
       break;
     case R_X86_64_GOTPCREL:
-      write32s(G + GOT + A - P);
+      write32s(G + GOTPLT + A - P);
       break;
     case R_X86_64_GOTPCREL64:
-      *(ul64 *)loc = G + GOT + A - P;
+      *(ul64 *)loc = G + GOTPLT + A - P;
       break;
     case R_X86_64_GOTPCRELX:
       if (sym.has_got(ctx)) {
-        write32s(G + GOT + A - P);
+        write32s(G + GOTPLT + A - P);
       } else {
         u32 insn = relax_gotpcrelx(loc - 2);
         loc[-2] = insn >> 8;
@@ -304,7 +305,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     case R_X86_64_REX_GOTPCRELX:
       if (sym.has_got(ctx)) {
-        write32s(G + GOT + A - P);
+        write32s(G + GOTPLT + A - P);
       } else {
         u32 insn = relax_rex_gotpcrelx(loc - 3);
         loc[-3] = insn >> 16;
@@ -435,10 +436,10 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       }
       break;
     case R_X86_64_DTPOFF32:
-      write32s(S + A - ctx.tls_begin);
+      write32s(S + A - ctx.dtp_addr);
       break;
     case R_X86_64_DTPOFF64:
-      *(ul64 *)loc = S + A - ctx.tls_begin;
+      *(ul64 *)loc = S + A - ctx.dtp_addr;
       break;
     case R_X86_64_TPOFF32:
       write32s(S + A - ctx.tp_addr);
@@ -486,12 +487,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     default:
       unreachable();
     }
-
-#undef S
-#undef A
-#undef P
-#undef G
-#undef GOT
   }
 }
 
@@ -545,8 +540,8 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     i64 frag_addend;
     std::tie(frag, frag_addend) = get_fragment(ctx, rel);
 
-#define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? frag_addend : (i64)rel.r_addend)
+    u64 S = frag ? frag->get_addr(ctx) : sym.get_addr(ctx);
+    u64 A = frag ? frag_addend : (i64)rel.r_addend;
 
     switch (rel.r_type) {
     case R_X86_64_8: {
@@ -577,13 +572,13 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       if (std::optional<u64> val = get_tombstone(sym, frag))
         *(ul32 *)loc = *val;
       else
-        write32s(S + A - ctx.tls_begin);
+        write32s(S + A - ctx.dtp_addr);
       break;
     case R_X86_64_DTPOFF64:
       if (std::optional<u64> val = get_tombstone(sym, frag))
         *(ul64 *)loc = *val;
       else
-        *(ul64 *)loc = S + A - ctx.tls_begin;
+        *(ul64 *)loc = S + A - ctx.dtp_addr;
       break;
     case R_X86_64_SIZE32:
       write32(sym.esym().st_size + A);
@@ -596,9 +591,6 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
                  << rel;
       break;
     }
-
-#undef S
-#undef A
   }
 }
 
@@ -629,23 +621,23 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     }
 
     if (sym.is_ifunc())
-      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
+      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
 
     switch (rel.r_type) {
     case R_X86_64_8:
     case R_X86_64_16:
     case R_X86_64_32:
     case R_X86_64_32S:
-      scan_rel(ctx, sym, rel, absrel_table);
+      scan_absrel(ctx, sym, rel);
       break;
     case R_X86_64_64:
-      scan_rel(ctx, sym, rel, dyn_absrel_table);
+      scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_X86_64_PC8:
     case R_X86_64_PC16:
     case R_X86_64_PC32:
     case R_X86_64_PC64:
-      scan_rel(ctx, sym, rel, pcrel_table);
+      scan_pcrel(ctx, sym, rel);
       break;
     case R_X86_64_GOT32:
     case R_X86_64_GOT64:
@@ -653,7 +645,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_X86_64_GOTPC64:
     case R_X86_64_GOTPCREL:
     case R_X86_64_GOTPCREL64:
-      sym.flags |= NEEDS_GOT;
+      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     case R_X86_64_GOTPCRELX: {
       if (rel.r_addend != -4)
@@ -662,7 +654,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       bool do_relax = ctx.arg.relax && !sym.is_imported &&
                       sym.is_relative() && relax_gotpcrelx(loc - 2);
       if (!do_relax)
-        sym.flags |= NEEDS_GOT;
+        sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     }
     case R_X86_64_REX_GOTPCRELX: {
@@ -672,13 +664,13 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       bool do_relax = ctx.arg.relax && !sym.is_imported &&
                       sym.is_relative() && relax_rex_gotpcrelx(loc - 3);
       if (!do_relax)
-        sym.flags |= NEEDS_GOT;
+        sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     }
     case R_X86_64_PLT32:
     case R_X86_64_PLTOFF64:
       if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
       break;
     case R_X86_64_TLSGD: {
       if (rel.r_addend != -4)
@@ -696,7 +688,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       if (relax_tlsgd(ctx, sym))
         i++;
       else
-        sym.flags |= NEEDS_TLSGD;
+        sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
       break;
     }
     case R_X86_64_TLSLD: {
@@ -715,19 +707,19 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       if (relax_tlsld(ctx))
         i++;
       else
-        ctx.needs_tlsld = true;
+        ctx.needs_tlsld.store(true, std::memory_order_relaxed);
       break;
     }
     case R_X86_64_GOTTPOFF: {
       if (rel.r_addend != -4)
         Fatal(ctx) << *this << ": bad r_addend for R_X86_64_GOTTPOFF";
 
-      ctx.has_gottp_rel = true;
+      ctx.has_gottp_rel.store(true, std::memory_order_relaxed);
 
       bool do_relax = ctx.arg.relax && !ctx.arg.shared &&
                       !sym.is_imported && relax_gottpoff(loc - 3);
       if (!do_relax)
-        sym.flags |= NEEDS_GOTTP;
+        sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
       break;
     }
     case R_X86_64_GOTPC32_TLSDESC: {
@@ -739,7 +731,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
                    << " against an invalid code sequence";
 
       if (!relax_tlsdesc(ctx, sym))
-        sym.flags |= NEEDS_TLSDESC;
+        sym.flags.fetch_or(NEEDS_TLSDESC, std::memory_order_relaxed);
       break;
     }
     case R_X86_64_GOTOFF64:

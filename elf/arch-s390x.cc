@@ -41,19 +41,8 @@ namespace mold::elf {
 
 using E = S390X;
 
-static void write_low12(u8 *loc, u64 val) {
-  *(ub16 *)loc &= 0xf000;
-  *(ub16 *)loc |= val & 0x0fff;
-}
-
 static void write_mid20(u8 *loc, u64 val) {
-  *(ub32 *)loc &= 0xf000'00ff;
   *(ub32 *)loc |= (bits(val, 11, 0) << 16) | (bits(val, 19, 12) << 8);
-}
-
-static void write_low24(u8 *loc, u64 val) {
-  *(ub32 *)loc &= 0xff00'0000;
-  *(ub32 *)loc |= val & 0x00ff'ffff;
 }
 
 template <>
@@ -106,6 +95,8 @@ void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
   switch (rel.r_type) {
+  case R_NONE:
+    break;
   case R_390_PC32:
     *(ub32 *)loc = val - this->shdr.sh_addr - offset;
     break;
@@ -150,11 +141,11 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
                    << " for relocation " << rel;
     };
 
-#define S   sym.get_addr(ctx)
-#define A   rel.r_addend
-#define P   (get_addr() + rel.r_offset)
-#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
-#define GOT ctx.got->shdr.sh_addr
+    u64 S = sym.get_addr(ctx);
+    u64 A = rel.r_addend;
+    u64 P = get_addr() + rel.r_offset;
+    u64 G = sym.get_got_idx(ctx) * sizeof(Word<E>);
+    u64 GOT = ctx.got->shdr.sh_addr;
 
     switch (rel.r_type) {
     case R_390_64:
@@ -169,7 +160,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_390_12: {
       i64 val = S + A;
       check(val, 0, 1 << 12);
-      write_low12(loc, val);
+      *(ul16 *)loc = bits(val, 11, 0);
       break;
     }
     case R_390_16: {
@@ -198,7 +189,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_390_PLT12DBL: {
       i64 val = S + A - P;
       check_dbl(val, -(1 << 12), 1 << 12);
-      write_low12(loc, val >> 1);
+      *(ul16 *)loc = (val >> 1) & 0x0fff;
       break;
     }
     case R_390_PC16: {
@@ -227,7 +218,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_390_PLT24DBL: {
       i64 val = S + A - P;
       check_dbl(val, -(1 << 24), 1 << 24);
-      write_low24(loc, val >> 1);
+      *(ub32 *)loc |= bits(val, 24, 1);
       break;
     }
     case R_390_PC32DBL:
@@ -235,7 +226,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (ctx.is_static && &sym == ctx.tls_get_offset) {
         // __tls_get_offset() in libc.a is stub code that calls abort().
         // So we provide a replacement function.
-        *(ub32 *)loc = (ctx.s390x_tls_get_offset->shdr.sh_addr - P) >> 1;
+        *(ub32 *)loc = (ctx.extra.tls_get_offset->shdr.sh_addr - P) >> 1;
       } else {
         i64 val = S + A - P;
         check_dbl(val, -(1LL << 32), 1LL << 32);
@@ -246,7 +237,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     case R_390_GOTPLT12: {
       i64 val = G + A;
       check(val, 0, 1 << 12);
-      write_low12(loc, val);
+      *(ul16 *)loc = bits(val, 11, 0);
       break;
     }
     case R_390_GOT16:
@@ -347,13 +338,13 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       break;
     case R_390_TLS_LDO32:
       if (ctx.got->has_tlsld(ctx))
-        *(ub32 *)loc = S + A - ctx.tls_begin;
+        *(ub32 *)loc = S + A - ctx.dtp_addr;
       else
         *(ub32 *)loc = S + A - ctx.tp_addr;
       break;
     case R_390_TLS_LDO64:
       if (ctx.got->has_tlsld(ctx))
-        *(ub64 *)loc = S + A - ctx.tls_begin;
+        *(ub64 *)loc = S + A - ctx.dtp_addr;
       else
         *(ub64 *)loc = S + A - ctx.tp_addr;
       break;
@@ -366,12 +357,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
     default:
       unreachable();
     }
-
-#undef S
-#undef A
-#undef P
-#undef G
-#undef GOT
   }
 }
 
@@ -403,8 +388,8 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     i64 frag_addend;
     std::tie(frag, frag_addend) = get_fragment(ctx, rel);
 
-#define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? frag_addend : (i64)rel.r_addend)
+    u64 S = frag ? frag->get_addr(ctx) : sym.get_addr(ctx);
+    u64 A = frag ? frag_addend : (i64)rel.r_addend;
 
     switch (rel.r_type) {
     case R_390_32: {
@@ -423,14 +408,11 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
       if (std::optional<u64> val = get_tombstone(sym, frag))
         *(ub64 *)loc = *val;
       else
-        *(ub64 *)loc = S + A - ctx.tls_begin;
+        *(ub64 *)loc = S + A - ctx.dtp_addr;
       break;
     default:
       Fatal(ctx) << *this << ": apply_reloc_nonalloc: " << rel;
     }
-
-#undef S
-#undef A
   }
 }
 
@@ -455,25 +437,25 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     }
 
     if (sym.is_ifunc())
-      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
+      sym.flags.fetch_or(NEEDS_GOT | NEEDS_PLT, std::memory_order_relaxed);
 
     switch (rel.r_type) {
     case R_390_64:
-      scan_rel(ctx, sym, rel, dyn_absrel_table);
+      scan_dyn_absrel(ctx, sym, rel);
       break;
     case R_390_8:
     case R_390_12:
     case R_390_16:
     case R_390_20:
     case R_390_32:
-      scan_rel(ctx, sym, rel, absrel_table);
+      scan_absrel(ctx, sym, rel);
       break;
     case R_390_PC16:
     case R_390_PC16DBL:
     case R_390_PC32:
     case R_390_PC32DBL:
     case R_390_PC64:
-      scan_rel(ctx, sym, rel, pcrel_table);
+      scan_pcrel(ctx, sym, rel);
       break;
     case R_390_GOT12:
     case R_390_GOT16:
@@ -491,7 +473,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_390_GOTPC:
     case R_390_GOTPCDBL:
     case R_390_GOTENT:
-      sym.flags |= NEEDS_GOT;
+      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
       break;
     case R_390_PLT12DBL:
     case R_390_PLT16DBL:
@@ -503,21 +485,21 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_390_PLTOFF32:
     case R_390_PLTOFF64:
       if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
+        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
       break;
     case R_390_TLS_GOTIE20:
     case R_390_TLS_IEENT:
-      sym.flags |= NEEDS_GOTTP;
+      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
       break;
     case R_390_TLS_GD32:
     case R_390_TLS_GD64:
       if (!relax_tlsgd(ctx, sym))
-        sym.flags |= NEEDS_TLSGD;
+        sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
       break;
     case R_390_TLS_LDM32:
     case R_390_TLS_LDM64:
       if (!relax_tlsld(ctx))
-        ctx.needs_tlsld = true;
+        ctx.needs_tlsld.store(true, std::memory_order_relaxed);
       break;
     case R_390_TLS_LE32:
     case R_390_TLS_LE64:
