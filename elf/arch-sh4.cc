@@ -26,6 +26,13 @@
 //    small to contain large immediates. On SH-4, large immediates are
 //    loaded from memory using `mov.l` PC-relative load instruction.
 //
+//  - Many RISC ISAs are, despite their name, actually fairly complex.
+//    They tend to have hundreds if not thousands of different instructions.
+//    SH-4 doesn't really have that many instructions because its 16-bit
+//    machine code simply can't encode many different opcodes. As a
+//    result, the number of relocations the linker has to support is also
+//    small.
+//
 // Beside these, SH-4 has a delay branch slot just like contemporary MIPS
 // and SPARC. That is, one instruction after a branch instruction will
 // always be executed even if the branch is taken. Delay branch slot allows
@@ -264,16 +271,11 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
-
-    if (!sym.file) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     SectionFragment<E> *frag;
     i64 frag_addend;
@@ -305,15 +307,10 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-
-    if (!sym.file) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     if (sym.is_ifunc())
       Error(ctx) << sym << ": GNU ifunc symbol is not supported on sh4";
@@ -326,25 +323,27 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       scan_pcrel(ctx, sym, rel);
       break;
     case R_SH_GOT32:
-      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOT;
       break;
     case R_SH_PLT32:
       if (sym.is_imported)
-        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
+        sym.flags |= NEEDS_PLT;
       break;
     case R_SH_TLS_GD_32:
-      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
+      sym.flags |= NEEDS_TLSGD;
       break;
     case R_SH_TLS_LD_32:
-      ctx.needs_tlsld.store(true, std::memory_order_relaxed);
+      ctx.needs_tlsld = true;
       break;
     case R_SH_TLS_IE_32:
-      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOTTP;
+      break;
+    case R_SH_TLS_LE_32:
+      check_tlsle(ctx, sym, rel);
       break;
     case R_SH_GOTPC:
     case R_SH_GOTOFF:
     case R_SH_TLS_LDO_32:
-    case R_SH_TLS_LE_32:
       break;
     default:
       Fatal(ctx) << *this << ": unknown relocation: " << rel;

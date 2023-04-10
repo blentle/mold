@@ -1,5 +1,5 @@
 #include "mold.h"
-#include "../cmdline.h"
+#include "../common/cmdline.h"
 
 #include <regex>
 #include <sstream>
@@ -98,7 +98,7 @@ Options:
   --gc-sections               Remove unreferenced sections
     --no-gc-sections
   --gdb-index                 Create .gdb_index for faster gdb startup
-  --hash-style [sysv,gnu,both]
+  --hash-style [sysv,gnu,both,none]
                               Set hash style
   --icf=[all,safe,none]       Fold identical code
     --no-icf
@@ -582,9 +582,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.Map = arg;
       ctx.arg.print_map = true;
     } else if (read_flag("print-dependencies")) {
-      ctx.arg.print_dependencies = 1;
-    } else if (read_flag("print-dependencies=full")) {
-      ctx.arg.print_dependencies = 2;
+      ctx.arg.print_dependencies = true;
     } else if (read_flag("print-map") || read_flag("M")) {
       ctx.arg.print_map = true;
     } else if (read_flag("Bstatic") || read_flag("dn") || read_flag("static")) {
@@ -670,6 +668,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       } else if (arg == "both") {
         ctx.arg.hash_style_sysv = true;
         ctx.arg.hash_style_gnu = true;
+      } else if (arg == "none") {
+        ctx.arg.hash_style_sysv = false;
+        ctx.arg.hash_style_gnu = false;
       } else {
         Fatal(ctx) << "invalid --hash-style argument: " << arg;
       }

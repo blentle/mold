@@ -1,4 +1,4 @@
-#include "mold.h"
+#include "common.h"
 #include "config.h"
 
 #include <cstring>
@@ -148,7 +148,7 @@ int main(int argc, char **argv) {
 
 #if MOLD_IS_SOLD
   std::string cmd = mold::filepath(argv[0]).filename().string();
-  if (cmd == "ld64" || cmd == "ld64.mold")
+  if (cmd == "ld64" || cmd.starts_with("ld64."))
     return mold::macho::main(argc, argv);
 #endif
 

@@ -57,7 +57,10 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
   // early for REL-type ELF types to read relocation addends from
   // section contents. For RELA-type, we don't need to do this because
   // addends are in relocations.
-  if constexpr (!E::is_rela)
+  //
+  // SH-4 stores addends to sections despite being RELA, which is a
+  // special (and buggy) case.
+  if constexpr (!E::is_rela || is_sh4<E>)
     uncompress(ctx);
 }
 
@@ -206,7 +209,7 @@ static void scan_rel(Context<E> &ctx, InputSection<E> &isec, Symbol<E> &sym,
     break;
   case IFUNC:
     dynrel();
-    ctx.num_ifunc_dynrels.fetch_add(1, std::memory_order_relaxed);
+    ctx.num_ifunc_dynrels++;
     break;
   default:
     unreachable();
@@ -307,6 +310,15 @@ void InputSection<E>::scan_toc_rel(Context<E> &ctx, Symbol<E> &sym,
 }
 
 template <typename E>
+void InputSection<E>::check_tlsle(Context<E> &ctx, Symbol<E> &sym,
+                                  const ElfRel<E> &rel) {
+  if (ctx.arg.shared)
+    Error(ctx) << *this << ": relocation " << rel << " against `" << sym
+               << "` can not be used when making a shared object;"
+               << " recompile with -fPIC";
+}
+
+template <typename E>
 static void apply_absrel(Context<E> &ctx, InputSection<E> &isec,
                          Symbol<E> &sym, const ElfRel<E> &rel, u8 *loc,
                          u64 S, i64 A, u64 P, ElfRel<E> *&dynrel,
@@ -350,10 +362,14 @@ static void apply_absrel(Context<E> &ctx, InputSection<E> &isec,
     apply_dynrel();
     break;
   case IFUNC: {
-    u64 addr = sym.get_addr(ctx, NO_PLT) + A;
-    *dynrel++ = ElfRel<E>(P, E::R_IRELATIVE, 0, addr);
-    if (ctx.arg.apply_dynamic_relocs)
-      *(Word<E> *)loc = addr;
+    if constexpr (supports_ifunc<E>) {
+      u64 addr = sym.get_addr(ctx, NO_PLT) + A;
+      *dynrel++ = ElfRel<E>(P, E::R_IRELATIVE, 0, addr);
+      if (ctx.arg.apply_dynamic_relocs)
+        *(Word<E> *)loc = addr;
+    } else {
+      unreachable();
+    }
     break;
   }
   default:
@@ -402,7 +418,7 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
 
 // Get the name of a function containin a given offset.
 template <typename E>
-std::string_view InputSection<E>::get_func_name(Context<E> &ctx, i64 offset) {
+std::string_view InputSection<E>::get_func_name(Context<E> &ctx, i64 offset) const {
   for (const ElfSym<E> &esym : file.elf_syms) {
     if (esym.st_shndx == shndx && esym.st_type == STT_FUNC &&
         esym.st_value <= offset && offset < esym.st_value + esym.st_size) {
@@ -415,61 +431,69 @@ std::string_view InputSection<E>::get_func_name(Context<E> &ctx, i64 offset) {
   return "";
 }
 
-// Record an undefined symbol error which will be displayed all at
-// once by report_undef_errors().
+// Test if the symbol a given relocation refers to has already been resolved.
+// If not, record that error and returns true.
 template <typename E>
-void InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) {
-  std::stringstream ss;
-  if (std::string_view source = file.get_source_name(); !source.empty())
-    ss << ">>> referenced by " << source << "\n";
-  else
-    ss << ">>> referenced by " << *this << "\n";
-
-  ss << ">>>               " << file;
-  if (std::string_view func = get_func_name(ctx, rel.r_offset); !func.empty())
-    ss << ":(" << func << ")";
+bool InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) {
+  // If a relocation refers to a linker-synthesized symbol for a
+  // section fragment, it's always been resolved.
+  if (file.elf_syms.size() <= rel.r_sym)
+    return false;
 
   Symbol<E> &sym = *file.symbols[rel.r_sym];
+  const ElfSym<E> &esym = file.elf_syms[rel.r_sym];
 
-  typename decltype(ctx.undef_errors)::accessor acc;
-  ctx.undef_errors.insert(acc, {sym.name(), {}});
-  acc->second.push_back(ss.str());
-}
-
-// Report all undefined symbols, grouped by symbol.
-template <typename E>
-void report_undef_errors(Context<E> &ctx) {
-  constexpr i64 max_errors = 3;
-
-  for (auto &pair : ctx.undef_errors) {
-    std::string_view sym_name = pair.first;
-    std::span<std::string> errors = pair.second;
-
-    if (ctx.arg.demangle)
-      sym_name = demangle(sym_name);
-
-    std::stringstream ss;
-    ss << "undefined symbol: " << sym_name << "\n";
-
-    for (i64 i = 0; i < errors.size() && i < max_errors; i++)
-      ss << errors[i];
-
-    if (errors.size() > max_errors)
-      ss << ">>> referenced " << (errors.size() - max_errors) << " more times\n";
-
-    if (ctx.arg.unresolved_symbols == UNRESOLVED_ERROR)
-      Error(ctx) << ss.str();
-    else if (ctx.arg.unresolved_symbols == UNRESOLVED_WARN)
-      Warn(ctx) << ss.str();
+  // If a symbol is defined in a comdat group, and the comdat group is
+  // discarded, the symbol may not have an owner. It is technically an
+  // violation of the One Definition Rule, so it is a programmer's fault.
+  if (!sym.file) {
+    Error(ctx) << *this << ": " << sym << " refers to a discarded COMDAT section"
+               << " probably due to an ODR violation";
+    return true;
   }
 
-  ctx.checkpoint();
+  auto record = [&] {
+    std::stringstream ss;
+    if (std::string_view source = file.get_source_name(); !source.empty())
+      ss << ">>> referenced by " << source << "\n";
+    else
+      ss << ">>> referenced by " << *this << "\n";
+
+    ss << ">>>               " << file;
+    if (std::string_view func = get_func_name(ctx, rel.r_offset); !func.empty())
+      ss << ":(" << func << ")";
+
+    typename decltype(ctx.undef_errors)::accessor acc;
+    ctx.undef_errors.insert(acc, {sym.name(), {}});
+    acc->second.push_back(ss.str());
+  };
+
+  // A non-weak undefined symbol must be promoted to an imported
+  // symbol or resolved to an defined symbol. Otherwise, it's an
+  // undefined symbol error.
+  //
+  // Every ELF file has an absolute local symbol as its first symbol.
+  // Referring to that symbol is always valid.
+  bool is_undef = esym.is_undef() && !esym.is_weak() && sym.sym_idx;
+  if (!sym.is_imported && is_undef && sym.esym().is_undef()) {
+    record();
+    return true;
+  }
+
+  // If a protected/hidden undefined symbol is resolved to other .so,
+  // it's handled as if no symbols were found.
+  if (sym.file->is_dso &&
+      (sym.visibility == STV_PROTECTED || sym.visibility == STV_HIDDEN)) {
+    record();
+    return true;
+  }
+
+  return false;
 }
 
 using E = MOLD_TARGET;
 
 template struct CieRecord<E>;
 template class InputSection<E>;
-template void report_undef_errors(Context<E> &);
 
 } // namespace mold::elf

@@ -1,4 +1,4 @@
-#include "mold.h"
+#include "common.h"
 
 #include <filesystem>
 #include <sys/stat.h>
@@ -7,8 +7,10 @@ namespace mold {
 
 std::string get_realpath(std::string_view path) {
   std::error_code ec;
-  std::string ret = std::filesystem::canonical(path, ec).string();
-  return ec ? std::string(path) : ret;
+  std::filesystem::path link = std::filesystem::read_symlink(path, ec);
+  if (ec)
+    return std::string(path);
+  return (filepath(path) / ".." / link).lexically_normal().string();
 }
 
 // Removes redundant '/..' or '/.' from a given path.

@@ -1,7 +1,7 @@
 #include "mold.h"
-#include "../archive-file.h"
-#include "../cmdline.h"
-#include "../output-file.h"
+#include "../common/archive-file.h"
+#include "../common/cmdline.h"
+#include "../common/output-file.h"
 
 #include <cstring>
 #include <functional>
@@ -75,21 +75,19 @@ std::string_view get_machine_type(Context<E> &ctx, MappedFile<Context<E>> *mf) {
     }
   };
 
-  bool opt_plugin = !ctx.arg.plugin.empty();
-
-  switch (get_file_type(mf, opt_plugin)) {
+  switch (get_file_type(ctx, mf)) {
   case FileType::ELF_OBJ:
   case FileType::ELF_DSO:
   case FileType::GCC_LTO_OBJ:
     return get_elf_type(mf->data);
   case FileType::AR:
     for (MappedFile<Context<E>> *child : read_fat_archive_members(ctx, mf))
-      if (get_file_type(child, opt_plugin) == FileType::ELF_OBJ)
+      if (get_file_type(ctx, child) == FileType::ELF_OBJ)
         return get_elf_type(child->data);
     return "";
   case FileType::THIN_AR:
     for (MappedFile<Context<E>> *child : read_thin_archive_members(ctx, mf))
-      if (get_file_type(child, opt_plugin) == FileType::ELF_OBJ)
+      if (get_file_type(ctx, child) == FileType::ELF_OBJ)
         return get_elf_type(child->data);
     return "";
   case FileType::TEXT:
@@ -163,9 +161,7 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   if (ctx.visited.contains(mf->name))
     return;
 
-  bool opt_plugin = !ctx.arg.plugin.empty();
-  FileType type = get_file_type(mf, opt_plugin);
-  switch (type) {
+  switch (get_file_type(ctx, mf)) {
   case FileType::ELF_OBJ:
     ctx.objs.push_back(new_object_file(ctx, mf, ""));
     return;
@@ -176,7 +172,7 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   case FileType::AR:
   case FileType::THIN_AR:
     for (MappedFile<Context<E>> *child : read_archive_members(ctx, mf)) {
-      switch (get_file_type(child, opt_plugin)) {
+      switch (get_file_type(ctx, child)) {
       case FileType::ELF_OBJ:
         ctx.objs.push_back(new_object_file(ctx, child, mf->name));
         break;
@@ -184,6 +180,10 @@ void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
       case FileType::LLVM_BITCODE:
         if (ObjectFile<E> *file = new_lto_obj(ctx, child, mf->name))
           ctx.objs.push_back(file);
+        break;
+      case FileType::ELF_DSO:
+        Warn(ctx) << mf->name << "(" << child->name
+                  << "): shared object file in an archive is ignored";
         break;
       default:
         break;
@@ -416,6 +416,8 @@ int elf_main(int argc, char **argv) {
     on_complete = fork_child();
 #endif
 
+  acquire_global_lock(ctx);
+
   tbb::global_control tbb_cont(tbb::global_control::max_allowed_parallelism,
                                ctx.arg.thread_count);
 
@@ -463,6 +465,9 @@ int elf_main(int argc, char **argv) {
   // These passes have complex interactions, and unfortunately has to be
   // put together in a single phase.
   resolve_symbols(ctx);
+
+  // "Kill" .eh_frame input sections after symbol resolution.
+  kill_eh_frame_sections(ctx);
 
   // Resolve mergeable section pieces to merge them.
   resolve_section_pieces(ctx);
@@ -546,10 +551,8 @@ int elf_main(int argc, char **argv) {
   // Beyond this point, no new symbols will be added to the result.
 
   // Handle --print-dependencies
-  if (ctx.arg.print_dependencies == 1)
+  if (ctx.arg.print_dependencies)
     print_dependencies(ctx);
-  else if (ctx.arg.print_dependencies == 2)
-    print_dependencies_full(ctx);
 
   // Handle -repro
   if (ctx.arg.repro)
@@ -729,6 +732,8 @@ int elf_main(int argc, char **argv) {
   if (on_complete)
     on_complete();
 
+  release_global_lock(ctx);
+
   if (ctx.arg.quick_exit)
     _exit(0);
 
@@ -741,6 +746,7 @@ int elf_main(int argc, char **argv) {
 using E = MOLD_TARGET;
 
 template void read_file(Context<E> &, MappedFile<Context<E>> *);
+template MappedFile<Context<E>> *open_library(Context<E> &, std::string);
 
 #ifdef MOLD_X86_64
 

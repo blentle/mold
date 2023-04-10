@@ -12,7 +12,7 @@
 // access instructions and therefore can support position-independent
 // code without too much hassle.
 //
-// https://github.com/rui314/mold/wiki/m68k-psabi.pdf
+// https://github.com/rui314/psabi/blob/main/m68k.pdf
 
 #include "mold.h"
 
@@ -221,16 +221,11 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
-
-    if (!sym.file) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     SectionFragment<E> *frag;
     i64 frag_addend;
@@ -262,15 +257,10 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_NONE)
+    if (rel.r_type == R_NONE || record_undef_error(ctx, rel))
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
-
-    if (!sym.file) {
-      record_undef_error(ctx, rel);
-      continue;
-    }
 
     if (sym.is_ifunc())
       Error(ctx) << sym << ": GNU ifunc symbol is not supported on m68k";
@@ -294,35 +284,37 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
     case R_68K_GOTOFF32:
     case R_68K_GOTOFF16:
     case R_68K_GOTOFF8:
-      sym.flags.fetch_or(NEEDS_GOT, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOT;
       break;
     case R_68K_PLT32:
     case R_68K_PLT16:
     case R_68K_PLT8:
       if (sym.is_imported)
-        sym.flags.fetch_or(NEEDS_PLT, std::memory_order_relaxed);
+        sym.flags |= NEEDS_PLT;
       break;
     case R_68K_TLS_GD32:
     case R_68K_TLS_GD16:
     case R_68K_TLS_GD8:
-      sym.flags.fetch_or(NEEDS_TLSGD, std::memory_order_relaxed);
+      sym.flags |= NEEDS_TLSGD;
       break;
     case R_68K_TLS_LDM32:
     case R_68K_TLS_LDM16:
     case R_68K_TLS_LDM8:
-      ctx.needs_tlsld.store(true, std::memory_order_relaxed);
+      ctx.needs_tlsld = true;
       break;
     case R_68K_TLS_IE32:
     case R_68K_TLS_IE16:
     case R_68K_TLS_IE8:
-      sym.flags.fetch_or(NEEDS_GOTTP, std::memory_order_relaxed);
+      sym.flags |= NEEDS_GOTTP;
+      break;
+    case R_68K_TLS_LE32:
+    case R_68K_TLS_LE16:
+    case R_68K_TLS_LE8:
+      check_tlsle(ctx, sym, rel);
       break;
     case R_68K_TLS_LDO32:
     case R_68K_TLS_LDO16:
     case R_68K_TLS_LDO8:
-    case R_68K_TLS_LE32:
-    case R_68K_TLS_LE16:
-    case R_68K_TLS_LE8:
       break;
     default:
       Error(ctx) << *this << ": unknown relocation: " << rel;

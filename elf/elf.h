@@ -1,8 +1,7 @@
 #pragma once
 
-#include "../integers.h"
+#include "../common/integers.h"
 
-#include <cstdint>
 #include <ostream>
 #include <string>
 #include <type_traits>
@@ -757,6 +756,9 @@ enum : u32 {
   R_RISCV_SET32 = 56,
   R_RISCV_32_PCREL = 57,
   R_RISCV_IRELATIVE = 58,
+  R_RISCV_PLT32 = 59,
+  R_RISCV_SET_ULEB128 = 60,
+  R_RISCV_SUB_ULEB128 = 61,
 };
 
 enum : u32 {
@@ -933,9 +935,13 @@ enum : u32 {
   R_PPC64_REL24_NOTOC = 116,
   R_PPC64_PLTSEQ = 119,
   R_PPC64_PLTCALL = 120,
+  R_PPC64_PLTSEQ_NOTOC = 121,
+  R_PPC64_PLTCALL_NOTOC = 122,
   R_PPC64_PCREL_OPT = 123,
   R_PPC64_PCREL34 = 132,
   R_PPC64_GOT_PCREL34 = 133,
+  R_PPC64_PLT_PCREL34 = 134,
+  R_PPC64_PLT_PCREL34_NOTOC = 135,
   R_PPC64_TPREL34 = 146,
   R_PPC64_DTPREL34 = 147,
   R_PPC64_GOT_TLSGD_PCREL34 = 148,
@@ -1453,14 +1459,8 @@ struct ElfPhdr<E> {
 // with a newly computed value.
 //
 // We don't want to have too many `if (REL)`s and `if (RELA)`s in our
-// codebase, so we write dynamic relocations in the following manner:
-//
-// - We always create a dynamic relocation with an addend. If it's REL,
-//   the addend will be discarded.
-//
-// - We also always write an addend to the relocated place by default
-//   even though it's redundant for RELA. If RELA, the written value
-//   will be ovewritten by the dynamic linker at load-time.
+// codebase, so ElfRel always takes r_addend as a constructor argument.
+// If it's REL, the argument will simply be ignored.
 template <typename E> requires E::is_le && E::is_rela
 struct ElfRel<E> {
   ElfRel() = default;
@@ -1582,6 +1582,9 @@ struct ElfSym<PPC64V2> {
   bool is_weak() const { return st_bind == STB_WEAK; }
   bool is_undef_weak() const { return is_undef() && is_weak(); }
 
+  bool preserves_r2() const { return ppc_local_entry != 1; }
+  bool uses_toc() const { return ppc_local_entry > 1; }
+
   ul32 st_name;
 
 #ifdef __LITTLE_ENDIAN__
@@ -1647,6 +1650,9 @@ struct ElfRel<SPARC64> {
 //
 // Machine descriptions
 //
+
+template <typename E>
+static constexpr bool supports_ifunc = requires { E::R_IRELATIVE; };
 
 template <typename E>
 static constexpr bool supports_tlsdesc = requires { E::R_TLSDESC; };
@@ -1896,7 +1902,6 @@ struct PPC64V1 {
   static constexpr u32 page_size = 65536;
   static constexpr u32 e_machine = EM_PPC64;
   static constexpr u32 plt_hdr_size = 52;
-  static constexpr u32 plt_size = 8;
   static constexpr u32 pltgot_size = 0;
   static constexpr u32 thunk_hdr_size = 0;
   static constexpr u32 thunk_size = 28;
@@ -1996,7 +2001,6 @@ struct M68K {
   static constexpr u32 R_JUMP_SLOT = R_68K_JMP_SLOT;
   static constexpr u32 R_ABS = R_68K_32;
   static constexpr u32 R_RELATIVE = R_68K_RELATIVE;
-  static constexpr u32 R_IRELATIVE = R_NONE;
   static constexpr u32 R_DTPOFF = R_68K_TLS_DTPREL32;
   static constexpr u32 R_TPOFF = R_68K_TLS_TPREL32;
   static constexpr u32 R_DTPMOD = R_68K_TLS_DTPMOD32;
@@ -2018,7 +2022,6 @@ struct SH4 {
   static constexpr u32 R_JUMP_SLOT = R_SH_JMP_SLOT;
   static constexpr u32 R_ABS = R_SH_DIR32;
   static constexpr u32 R_RELATIVE = R_SH_RELATIVE;
-  static constexpr u32 R_IRELATIVE = R_NONE;
   static constexpr u32 R_DTPOFF = R_SH_TLS_DTPOFF32;
   static constexpr u32 R_TPOFF = R_SH_TLS_TPOFF32;
   static constexpr u32 R_DTPMOD = R_SH_TLS_DTPMOD32;
@@ -2040,7 +2043,6 @@ struct ALPHA {
   static constexpr u32 R_JUMP_SLOT = R_ALPHA_JMP_SLOT;
   static constexpr u32 R_ABS = R_ALPHA_REFQUAD;
   static constexpr u32 R_RELATIVE = R_ALPHA_RELATIVE;
-  static constexpr u32 R_IRELATIVE = R_NONE;
   static constexpr u32 R_DTPOFF = R_ALPHA_DTPREL64;
   static constexpr u32 R_TPOFF = R_ALPHA_TPREL64;
   static constexpr u32 R_DTPMOD = R_ALPHA_DTPMOD64;

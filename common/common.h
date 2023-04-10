@@ -32,13 +32,30 @@
 #endif
 
 #define XXH_INLINE_ALL 1
-#include "third-party/xxhash/xxhash.h"
+#include "../third-party/xxhash/xxhash.h"
 
 #ifdef NDEBUG
 # define unreachable() __builtin_unreachable()
 #else
 # define unreachable() assert(0 && "unreachable")
 #endif
+
+// __builtin_assume() is supported only by clang, and [[assume]] is
+// available only in C++23, so we use this macro when giving a hint to
+// the compiler's optimizer what's true.
+#define ASSUME(x) do { if (!(x)) __builtin_unreachable(); } while (0)
+
+// This is an assert() that is enabled even in the release build.
+#define ASSERT(x)                                       \
+  do {                                                  \
+    if (!(x)) {                                         \
+      std::cerr << "Assertion failed: (" << #x          \
+                << "), function " << __FUNCTION__       \
+                << ", file " << __FILE__                \
+                << ", line " << __LINE__ << ".\n";      \
+      std::abort();                                     \
+    }                                                   \
+  } while (0)
 
 inline uint64_t hash_string(std::string_view str) {
   return XXH3_64bits(str.data(), str.size());
@@ -60,7 +77,7 @@ namespace mold {
 using namespace std::literals::string_literals;
 using namespace std::literals::string_view_literals;
 
-template <typename C> class OutputFile;
+template <typename Context> class OutputFile;
 
 inline char *output_tmpfile;
 inline thread_local bool opt_demangle;
@@ -86,41 +103,44 @@ static u64 combine_hash(u64 a, u64 b) {
 // Error output
 //
 
-template <typename C>
+template <typename Context>
 class SyncOut {
 public:
-  SyncOut(C &ctx, std::ostream &out = std::cout) : out(out) {
+  SyncOut(Context &ctx, std::ostream *out = &std::cout) : out(out) {
     opt_demangle = ctx.arg.demangle;
   }
 
   ~SyncOut() {
-    std::scoped_lock lock(mu);
-    out << ss.str() << "\n";
+    if (out) {
+      std::scoped_lock lock(mu);
+      *out << ss.str() << "\n";
+    }
   }
 
   template <class T> SyncOut &operator<<(T &&val) {
-    ss << std::forward<T>(val);
+    if (out)
+      ss << std::forward<T>(val);
     return *this;
   }
 
   static inline std::mutex mu;
 
 private:
-  std::ostream &out;
+  std::ostream *out;
   std::stringstream ss;
 };
 
-template <typename C>
-static std::string add_color(C &ctx, std::string msg) {
+template <typename Context>
+static std::string add_color(Context &ctx, std::string msg) {
   if (ctx.arg.color_diagnostics)
     return "mold: \033[0;1;31m" + msg + ":\033[0m ";
   return "mold: " + msg + ": ";
 }
 
-template <typename C>
+template <typename Context>
 class Fatal {
 public:
-  Fatal(C &ctx) : out(ctx, std::cerr) {
+  Fatal(Context &ctx) : out(ctx, &std::cerr) {
     out << add_color(ctx, "fatal");
   }
 
@@ -136,13 +156,13 @@ public:
   }
 
 private:
-  SyncOut<C> out;
+  SyncOut<Context> out;
 };
 
-template <typename C>
+template <typename Context>
 class Error {
 public:
-  Error(C &ctx) : out(ctx, std::cerr) {
+  Error(Context &ctx) : out(ctx, &std::cerr) {
     if (ctx.arg.noinhibit_exec) {
       out << add_color(ctx, "warning");
     } else {
@@ -157,13 +177,14 @@ public:
   }
 
 private:
-  SyncOut<C> out;
+  SyncOut<Context> out;
 };
 
-template <typename C>
+template <typename Context>
 class Warn {
 public:
-  Warn(C &ctx) : out(ctx, std::cerr) {
+  Warn(Context &ctx)
+    : out(ctx, ctx.arg.suppress_warnings ? nullptr : &std::cerr) {
     if (ctx.arg.fatal_warnings) {
       out << add_color(ctx, "error");
       ctx.has_error = true;
@@ -178,7 +199,64 @@ public:
   }
 
 private:
-  SyncOut<C> out;
+  SyncOut<Context> out;
+};
+
+//
+// Atomics
+//
+
+// This is the same as std::atomic except that the default memory
+// order is relaxed instead of sequential consistency.
+template <typename T>
+struct Atomic : std::atomic<T> {
+  static constexpr std::memory_order relaxed = std::memory_order_relaxed;
+
+  using std::atomic<T>::atomic;
+
+  Atomic(const Atomic<T> &other) { store(other.load()); }
+
+  Atomic<T> &operator=(const Atomic<T> &other) {
+    store(other.load());
+    return *this;
+  }
+
+  void operator=(T val) { store(val); }
+  operator T() const { return load(); }
+
+  void store(T val) { std::atomic<T>::store(val, relaxed); }
+  T load() const { return std::atomic<T>::load(relaxed); }
+  T exchange(T val) { return std::atomic<T>::exchange(val, relaxed); }
+  T operator|=(T val) { return std::atomic<T>::fetch_or(val, relaxed); }
+  T operator++() { return std::atomic<T>::fetch_add(1, relaxed) + 1; }
+  T operator--() { return std::atomic<T>::fetch_sub(1, relaxed) - 1; }
+  T operator++(int) { return std::atomic<T>::fetch_add(1, relaxed); }
+  T operator--(int) { return std::atomic<T>::fetch_sub(1, relaxed); }
+
+  bool test_and_set() {
+    // A relaxed load + branch (assuming miss) takes only around 20 cycles,
+    // while an atomic RMW can easily take hundreds on x86. We note that it's
+    // common that another thread beat us in marking, so doing an optimistic
+    // early test tends to improve performance in the ~20% ballpark.
+    return load() || exchange(true);
+  }
+};
+
+//
+// Bit vector
+//
+
+class BitVector {
+public:
+  BitVector() = default;
+  BitVector(u32 size) : vec((size + 7) / 8) {}
+
+  void resize(u32 size) { vec.resize((size + 7) / 8); }
+  bool get(u32 idx) const { return vec[idx / 8] & (1 << (idx % 8)); }
+  void set(u32 idx) { vec[idx / 8] |= 1 << (idx % 8); }
+
+private:
+  std::vector<u8> vec;
 };
 
 //
@@ -238,17 +316,6 @@ void update_maximum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
                                        std::memory_order_relaxed));
 }
 
-// An optimized "mark" operation for parallel mark-and-sweep algorithms.
-// Returns true if `visited` was false and updated to true.
-inline bool fast_mark(std::atomic<bool> &visited) {
-  // A relaxed load + branch (assuming miss) takes only around 20 cycles,
-  // while an atomic RMW can easily take hundreds on x86. We note that it's
-  // common that another thread beat us in marking, so doing an optimistic
-  // early test tends to improve performance in the ~20% ballpark.
-  return !visited.load(std::memory_order_relaxed) &&
-         !visited.exchange(true, std::memory_order_relaxed);
-}
-
 template <typename T, typename U>
 inline void append(std::vector<T> &vec1, std::vector<U> vec2) {
   vec1.insert(vec1.end(), vec2.begin(), vec2.end());
@@ -256,7 +323,12 @@ inline void append(std::vector<T> &vec1, std::vector<U> vec2) {
 
 template <typename T>
 inline std::vector<T> flatten(std::vector<std::vector<T>> &vec) {
+  i64 size = 0;
+  for (std::vector<T> &v : vec)
+    size += v.size();
+
   std::vector<T> ret;
+  ret.reserve(size);
   for (std::vector<T> &v : vec)
     append(ret, v);
   return ret;
@@ -356,8 +428,8 @@ inline i64 uleb_size(u64 val) {
   return 9;
 }
 
-template <typename C>
-std::string_view save_string(C &ctx, const std::string &str) {
+template <typename Context>
+std::string_view save_string(Context &ctx, const std::string &str) {
   u8 *buf = new u8[str.size() + 1];
   memcpy(buf, str.data(), str.size());
   buf[str.size()] = '\0';
@@ -405,9 +477,9 @@ public:
     nbuckets = std::max<i64>(MIN_NBUCKETS, bit_ceil(nbuckets));
 
     this->nbuckets = nbuckets;
-    keys = (std::atomic<const char *> *)calloc(nbuckets, sizeof(keys[0]));
-    key_sizes = (u32 *)calloc(nbuckets, sizeof(key_sizes[0]));
-    values = (T *)calloc(nbuckets, sizeof(values[0]));
+    keys = (std::atomic<const char *> *)calloc(nbuckets, sizeof(char *));
+    key_sizes = (u32 *)malloc(nbuckets * sizeof(u32));
+    values = (T *)malloc(nbuckets * sizeof(T));
   }
 
   std::pair<T *, bool> insert(std::string_view key, u64 hash, const T &val) {
@@ -427,7 +499,7 @@ public:
 
       if (ptr == nullptr) {
         if (!keys[idx].compare_exchange_weak(ptr, marker,
-                                             std::memory_order_acq_rel))
+                                             std::memory_order_acquire))
           continue;
         new (values + idx) T(val);
         key_sizes[idx] = key.size();
@@ -448,7 +520,7 @@ public:
     return {nullptr, false};
   }
 
-  bool has_key(i64 idx) {
+  const char *get_key(i64 idx) {
     return keys[idx].load(std::memory_order_relaxed);
   }
 
@@ -457,7 +529,6 @@ public:
   static constexpr i64 MAX_RETRY = 128;
 
   i64 nbuckets = 0;
-  std::atomic<const char *> *keys = nullptr;
   u32 *key_sizes = nullptr;
   T *values = nullptr;
 
@@ -470,6 +541,8 @@ private:
 #endif
   }
 
+private:
+  std::atomic<const char *> *keys = nullptr;
   static constexpr const char *marker = "marker";
 };
 
@@ -477,13 +550,13 @@ private:
 // output-file.h
 //
 
-template <typename C>
+template <typename Context>
 class OutputFile {
 public:
-  static std::unique_ptr<OutputFile<C>>
-  open(C &ctx, std::string path, i64 filesize, i64 perm);
+  static std::unique_ptr<OutputFile<Context>>
+  open(Context &ctx, std::string path, i64 filesize, i64 perm);
 
-  virtual void close(C &ctx) = 0;
+  virtual void close(Context &ctx) = 0;
   virtual ~OutputFile() = default;
 
   u8 *buf = nullptr;
@@ -646,13 +719,13 @@ public:
   }
 
   Counter &operator++(int) {
-    if (enabled)
+    if (enabled) [[unlikely]]
       values.local()++;
     return *this;
   }
 
   Counter &operator+=(int delta) {
-    if (enabled)
+    if (enabled) [[unlikely]]
       values.local() += delta;
     return *this;
   }
@@ -689,10 +762,10 @@ struct TimerRecord {
 void
 print_timer_records(tbb::concurrent_vector<std::unique_ptr<TimerRecord>> &);
 
-template <typename C>
+template <typename Context>
 class Timer {
 public:
-  Timer(C &ctx, std::string name, Timer *parent = nullptr) {
+  Timer(Context &ctx, std::string name, Timer *parent = nullptr) {
     record = new TimerRecord(name, parent ? parent->record : nullptr);
     ctx.timer_records.push_back(std::unique_ptr<TimerRecord>(record));
   }
@@ -743,16 +816,16 @@ private:
 
 // MappedFile represents an mmap'ed input file.
 // mold uses mmap-IO only.
-template <typename C>
+template <typename Context>
 class MappedFile {
 public:
-  static MappedFile *open(C &ctx, std::string path);
-  static MappedFile *must_open(C &ctx, std::string path);
+  static MappedFile *open(Context &ctx, std::string path);
+  static MappedFile *must_open(Context &ctx, std::string path);
 
   ~MappedFile() { unmap(); }
   void unmap();
 
-  MappedFile *slice(C &ctx, std::string name, u64 start, u64 size);
+  MappedFile *slice(Context &ctx, std::string name, u64 start, u64 size);
 
   std::string_view get_contents() {
     return std::string_view((char *)data, size);
@@ -782,7 +855,6 @@ public:
   std::string name;
   u8 *data = nullptr;
   i64 size = 0;
-  i64 mtime = 0;
   bool given_fullpath = true;
   MappedFile *parent = nullptr;
   MappedFile *thin_parent = nullptr;
@@ -792,8 +864,8 @@ public:
 #endif
 };
 
-template <typename C>
-MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
+template <typename Context>
+MappedFile<Context> *MappedFile<Context>::open(Context &ctx, std::string path) {
   if (path.starts_with('/') && !ctx.arg.chroot.empty())
     path = ctx.arg.chroot + "/" + path_clean(path);
 
@@ -816,14 +888,6 @@ MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
 
   mf->name = path;
   mf->size = st.st_size;
-
-#ifdef _WIN32
-    mf->mtime = st.st_mtime;
-#elif defined(__APPLE__)
-    mf->mtime = (u64)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec;
-#else
-    mf->mtime = (u64)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
-#endif
 
   if (st.st_size > 0) {
 #ifdef _WIN32
@@ -848,17 +912,18 @@ MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
   return mf;
 }
 
-template <typename C>
-MappedFile<C> *MappedFile<C>::must_open(C &ctx, std::string path) {
+template <typename Context>
+MappedFile<Context> *
+MappedFile<Context>::must_open(Context &ctx, std::string path) {
   if (MappedFile *mf = MappedFile::open(ctx, path))
     return mf;
   Fatal(ctx) << "cannot open " << path << ": " << errno_string();
 }
 
-template <typename C>
-MappedFile<C> *
-MappedFile<C>::slice(C &ctx, std::string name, u64 start, u64 size) {
-  MappedFile *mf = new MappedFile<C>;
+template <typename Context>
+MappedFile<Context> *
+MappedFile<Context>::slice(Context &ctx, std::string name, u64 start, u64 size) {
+  MappedFile *mf = new MappedFile;
   mf->name = name;
   mf->data = data + start;
   mf->size = size;
@@ -868,8 +933,8 @@ MappedFile<C>::slice(C &ctx, std::string name, u64 start, u64 size) {
   return mf;
 }
 
-template <typename C>
-void MappedFile<C>::unmap() {
+template <typename Context>
+void MappedFile<Context>::unmap() {
   if (size == 0 || parent || !data)
     return;
 
