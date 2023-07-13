@@ -191,6 +191,7 @@ Options:
                               Separate all loadable segments to different pages
     -z separate-code          Separate code and data into different pages
     -z noseparate-code        Allow overlap in pages
+  -z stack-size=VALUE         Set size of stack segment
   -z relro                    Make some sections read-only after relocation (default)
     -z norelro
   -z text                     Report error if DT_TEXTREL is set
@@ -692,7 +693,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("pie") || read_flag("pic-executable")) {
       ctx.arg.pic = true;
       ctx.arg.pie = true;
-    } else if (read_flag("no-pie") || read_flag("no-pic-executable")) {
+    } else if (read_flag("no-pie") || read_flag("no-pic-executable") ||
+               read_flag("nopie")) {
       ctx.arg.pic = false;
       ctx.arg.pie = false;
     } else if (read_flag("relax")) {
@@ -865,6 +867,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       z_separate_code = SEPARATE_CODE;
     } else if (read_z_flag("noseparate-code")) {
       z_separate_code = NOSEPARATE_CODE;
+    } else if (read_z_arg("stack-size")) {
+      ctx.arg.z_stack_size = parse_number(ctx, "-z stack-size", arg);
     } else if (read_z_flag("dynamic-undefined-weak")) {
       ctx.arg.z_dynamic_undefined_weak = true;
     } else if (read_z_flag("nodynamic-undefined-weak")) {

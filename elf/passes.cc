@@ -453,7 +453,7 @@ get_output_name(Context<E> &ctx, std::string_view name, u64 flags) {
   static std::string_view prefixes[] = {
     ".text.", ".data.rel.ro.", ".data.", ".rodata.", ".bss.rel.ro.", ".bss.",
     ".init_array.", ".fini_array.", ".tbss.", ".tdata.", ".gcc_except_table.",
-    ".ctors.", ".dtors.", ".gnu.warning.",
+    ".ctors.", ".dtors.", ".gnu.warning.", ".openbsd.randomdata.",
   };
 
   for (std::string_view prefix : prefixes) {
@@ -1262,6 +1262,7 @@ void claim_unresolved_symbols(Context<E> &ctx) {
         Symbol<E> *sym2 = get_symbol(ctx, name);
         if (sym2->file && sym2->file->is_dso && sym2->get_version() == ver) {
           file->symbols[i] = sym2;
+          sym2->is_imported = true;
           continue;
         }
       }
@@ -1604,8 +1605,14 @@ void parse_symbol_version(Context<E> &ctx) {
       if (sym->file != file)
         continue;
 
-      const char *name = file->symbol_strtab.data() + file->elf_syms[i].st_name;
-      std::string_view ver = strchr(name, '@') + 1;
+      std::string_view ver;
+
+      if (file->is_lto_obj) {
+        ver = file->lto_symbol_versions[i - file->first_global];
+      } else {
+        const char *name = file->symbol_strtab.data() + file->elf_syms[i].st_name;
+        ver = strchr(name, '@') + 1;
+      }
 
       bool is_default = false;
       if (ver.starts_with('@')) {

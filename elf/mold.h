@@ -1254,6 +1254,9 @@ public:
   i64 num_areas = 0;
   i64 area_offset = 0;
 
+  // For LTO
+  std::vector<std::string_view> lto_symbol_versions;
+
   // For PPC32
   InputSection<E> *ppc32_got2 = nullptr;
 
@@ -1702,6 +1705,7 @@ struct Context {
     i64 filler = -1;
     i64 spare_dynamic_tags = 5;
     i64 thread_count = 0;
+    i64 z_stack_size = 0;
     std::string_view emulation;
     std::optional<Glob> unique;
     std::optional<u64> physical_image_base;
