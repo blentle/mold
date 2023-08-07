@@ -2,6 +2,12 @@
 
 namespace mold::elf {
 
+static std::string unknown_type(u32 r_type) {
+  char buf[50];
+  snprintf(buf, sizeof(buf), "unknown (0x%x)", r_type);
+  return buf;
+}
+
 template <>
 std::string rel_to_string<X86_64>(u32 r_type) {
   switch (r_type) {
@@ -46,7 +52,7 @@ std::string rel_to_string<X86_64>(u32 r_type) {
   case R_X86_64_GOTPCRELX: return "R_X86_64_GOTPCRELX";
   case R_X86_64_REX_GOTPCRELX: return "R_X86_64_REX_GOTPCRELX";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -95,7 +101,7 @@ std::string rel_to_string<I386>(u32 r_type) {
   case R_386_IRELATIVE: return "R_386_IRELATIVE";
   case R_386_GOT32X: return "R_386_GOT32X";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -206,7 +212,7 @@ std::string rel_to_string<ARM64>(u32 r_type) {
   case R_AARCH64_TLSDESC: return "R_AARCH64_TLSDESC";
   case R_AARCH64_IRELATIVE: return "R_AARCH64_IRELATIVE";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -348,7 +354,7 @@ std::string rel_to_string<ARM32>(u32 r_type) {
   case R_ARM_THM_BF18: return "R_ARM_THM_BF18";
   case R_ARM_IRELATIVE: return "R_ARM_IRELATIVE";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -407,7 +413,7 @@ std::string rel_to_string<RV64LE>(u32 r_type) {
   case R_RISCV_SET_ULEB128: return "R_RISCV_SET_ULEB128";
   case R_RISCV_SUB_ULEB128: return "R_RISCV_SUB_ULEB128";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -504,7 +510,7 @@ std::string rel_to_string<PPC32>(u32 r_type) {
   case R_PPC_REL16_HI: return "R_PPC_REL16_HI";
   case R_PPC_REL16_HA: return "R_PPC_REL16_HA";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -623,7 +629,7 @@ std::string rel_to_string<PPC64V1>(u32 r_type) {
   case R_PPC64_REL16_HI: return "R_PPC64_REL16_HI";
   case R_PPC64_REL16_HA: return "R_PPC64_REL16_HA";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -720,7 +726,7 @@ std::string rel_to_string<SPARC64>(u32 r_type) {
   case R_SPARC_GOTDATA_OP: return "R_SPARC_GOTDATA_OP";
   case R_SPARC_IRELATIVE: return "R_SPARC_IRELATIVE";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -793,7 +799,7 @@ std::string rel_to_string<S390X>(u32 r_type) {
   case R_390_PC24DBL: return "R_390_PC24DBL";
   case R_390_PLT24DBL: return "R_390_PLT24DBL";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -841,7 +847,7 @@ std::string rel_to_string<M68K>(u32 r_type) {
   case R_68K_TLS_DTPREL32: return "R_68K_TLS_DTPREL32";
   case R_68K_TLS_TPREL32: return "R_68K_TLS_TPREL32";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -875,7 +881,7 @@ std::string rel_to_string<SH4>(u32 r_type) {
   case R_SH_GOTPC: return "R_SH_GOTPC";
   case R_SH_GOTPLT32: return "R_SH_GOTPLT32";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
 }
 
 template <>
@@ -915,7 +921,95 @@ std::string rel_to_string<ALPHA>(u32 r_type) {
   case R_ALPHA_TPRELLO: return "R_ALPHA_TPRELLO";
   case R_ALPHA_TPREL16: return "R_ALPHA_TPREL16";
   }
-  return "unknown (" + std::to_string(r_type) + ")";
+  return unknown_type(r_type);
+}
+
+template <>
+std::string rel_to_string<MIPS64LE>(u32 r_type) {
+  switch (r_type) {
+  case R_MIPS_NONE: return "R_MIPS_NONE";
+  case R_MIPS_16: return "R_MIPS_16";
+  case R_MIPS_32: return "R_MIPS_32";
+  case R_MIPS_REL32: return "R_MIPS_REL32";
+  case R_MIPS_26: return "R_MIPS_26";
+  case R_MIPS_HI16: return "R_MIPS_HI16";
+  case R_MIPS_LO16: return "R_MIPS_LO16";
+  case R_MIPS_GPREL16: return "R_MIPS_GPREL16";
+  case R_MIPS_LITERAL: return "R_MIPS_LITERAL";
+  case R_MIPS_GOT16: return "R_MIPS_GOT16";
+  case R_MIPS_PC16: return "R_MIPS_PC16";
+  case R_MIPS_CALL16: return "R_MIPS_CALL16";
+  case R_MIPS_GPREL32: return "R_MIPS_GPREL32";
+  case R_MIPS_UNUSED1: return "R_MIPS_UNUSED1";
+  case R_MIPS_UNUSED2: return "R_MIPS_UNUSED2";
+  case R_MIPS_UNUSED3: return "R_MIPS_UNUSED3";
+  case R_MIPS_SHIFT5: return "R_MIPS_SHIFT5";
+  case R_MIPS_SHIFT6: return "R_MIPS_SHIFT6";
+  case R_MIPS_64: return "R_MIPS_64";
+  case R_MIPS_GOT_DISP: return "R_MIPS_GOT_DISP";
+  case R_MIPS_GOT_PAGE: return "R_MIPS_GOT_PAGE";
+  case R_MIPS_GOT_OFST: return "R_MIPS_GOT_OFST";
+  case R_MIPS_GOT_HI16: return "R_MIPS_GOT_HI16";
+  case R_MIPS_GOT_LO16: return "R_MIPS_GOT_LO16";
+  case R_MIPS_SUB: return "R_MIPS_SUB";
+  case R_MIPS_INSERT_A: return "R_MIPS_INSERT_A";
+  case R_MIPS_INSERT_B: return "R_MIPS_INSERT_B";
+  case R_MIPS_DELETE: return "R_MIPS_DELETE";
+  case R_MIPS_HIGHER: return "R_MIPS_HIGHER";
+  case R_MIPS_HIGHEST: return "R_MIPS_HIGHEST";
+  case R_MIPS_CALL_HI16: return "R_MIPS_CALL_HI16";
+  case R_MIPS_CALL_LO16: return "R_MIPS_CALL_LO16";
+  case R_MIPS_SCN_DISP: return "R_MIPS_SCN_DISP";
+  case R_MIPS_REL16: return "R_MIPS_REL16";
+  case R_MIPS_ADD_IMMEDIATE: return "R_MIPS_ADD_IMMEDIATE";
+  case R_MIPS_PJUMP: return "R_MIPS_PJUMP";
+  case R_MIPS_RELGOT: return "R_MIPS_RELGOT";
+  case R_MIPS_JALR: return "R_MIPS_JALR";
+  case R_MIPS_TLS_DTPMOD32: return "R_MIPS_TLS_DTPMOD32";
+  case R_MIPS_TLS_DTPREL32: return "R_MIPS_TLS_DTPREL32";
+  case R_MIPS_TLS_DTPMOD64: return "R_MIPS_TLS_DTPMOD64";
+  case R_MIPS_TLS_DTPREL64: return "R_MIPS_TLS_DTPREL64";
+  case R_MIPS_TLS_GD: return "R_MIPS_TLS_GD";
+  case R_MIPS_TLS_LDM: return "R_MIPS_TLS_LDM";
+  case R_MIPS_TLS_DTPREL_HI16: return "R_MIPS_TLS_DTPREL_HI16";
+  case R_MIPS_TLS_DTPREL_LO16: return "R_MIPS_TLS_DTPREL_LO16";
+  case R_MIPS_TLS_GOTTPREL: return "R_MIPS_TLS_GOTTPREL";
+  case R_MIPS_TLS_TPREL32: return "R_MIPS_TLS_TPREL32";
+  case R_MIPS_TLS_TPREL64: return "R_MIPS_TLS_TPREL64";
+  case R_MIPS_TLS_TPREL_HI16: return "R_MIPS_TLS_TPREL_HI16";
+  case R_MIPS_TLS_TPREL_LO16: return "R_MIPS_TLS_TPREL_LO16";
+  case R_MIPS_GLOB_DAT: return "R_MIPS_GLOB_DAT";
+  case R_MIPS_PC21_S2: return "R_MIPS_PC21_S2";
+  case R_MIPS_PC26_S2: return "R_MIPS_PC26_S2";
+  case R_MIPS_PC18_S3: return "R_MIPS_PC18_S3";
+  case R_MIPS_PC19_S2: return "R_MIPS_PC19_S2";
+  case R_MIPS_PCHI16: return "R_MIPS_PCHI16";
+  case R_MIPS_PCLO16: return "R_MIPS_PCLO16";
+  case R_MIPS16_26: return "R_MIPS16_26";
+  case R_MIPS16_GPREL: return "R_MIPS16_GPREL";
+  case R_MIPS16_GOT16: return "R_MIPS16_GOT16";
+  case R_MIPS16_CALL16: return "R_MIPS16_CALL16";
+  case R_MIPS16_HI16: return "R_MIPS16_HI16";
+  case R_MIPS16_LO16: return "R_MIPS16_LO16";
+  case R_MIPS16_TLS_GD: return "R_MIPS16_TLS_GD";
+  case R_MIPS16_TLS_LDM: return "R_MIPS16_TLS_LDM";
+  case R_MIPS16_TLS_DTPREL_HI16: return "R_MIPS16_TLS_DTPREL_HI16";
+  case R_MIPS16_TLS_DTPREL_LO16: return "R_MIPS16_TLS_DTPREL_LO16";
+  case R_MIPS16_TLS_GOTTPREL: return "R_MIPS16_TLS_GOTTPREL";
+  case R_MIPS16_TLS_TPREL_HI16: return "R_MIPS16_TLS_TPREL_HI16";
+  case R_MIPS16_TLS_TPREL_LO16: return "R_MIPS16_TLS_TPREL_LO16";
+  case R_MIPS_COPY: return "R_MIPS_COPY";
+  case R_MIPS_JUMP_SLOT: return "R_MIPS_JUMP_SLOT";
+  case R_MIPS_NUM: return "R_MIPS_NUM";
+  case R_MIPS_PC32: return "R_MIPS_PC32";
+  case R_MIPS_EH: return "R_MIPS_EH";
+  }
+  return unknown_type(r_type);
+}
+
+template <>
+std::string rel_to_string<MIPS64BE>(u32 r_type) {
+  return rel_to_string<MIPS64LE>(r_type);
 }
 
 } // namespace mold::elf

@@ -160,7 +160,7 @@ u64 get_tp_addr(Context<E> &ctx) {
     // of TLV template image when copying TLVs to the TLS block, so we need
     // to offset it.
     return align_down(phdr->p_vaddr - sizeof(Word<E>) * 2, phdr->p_align);
-  } else if constexpr (is_ppc<E> || is_m68k<E>) {
+  } else if constexpr (is_ppc<E> || is_m68k<E> || is_mips<E>) {
     // On PPC and m68k, TP is 0x7000 (28 KiB) past the beginning of the TLV
     // block to maximize the addressable range for load/store instructions
     // with 16-bits signed immediates. It's not exactly 0x8000 (32 KiB) off
@@ -185,7 +185,7 @@ u64 get_dtp_addr(Context<E> &ctx) {
   if (!phdr)
     return 0;
 
-  if constexpr (is_ppc<E> || is_m68k<E>) {
+  if constexpr (is_ppc<E> || is_m68k<E> || is_mips<E>) {
     // On PPC64 and m68k, R_DTPOFF is resolved to the address 0x8000
     // (32 KiB) past the start of the TLS block. The bias maximizes the
     // accessible range for load/store instructions with 16-bits signed

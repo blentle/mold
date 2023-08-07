@@ -44,7 +44,7 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.13)
-project(mold VERSION 1.11.0)
+project(mold VERSION 2.0.0)
 
 include(CMakeDependentOption)
 include(GNUInstallDirs)
@@ -288,8 +288,8 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 # compiler instances. This is hacky but greatly reduces compile time
 # on a multicore machine.
 list(APPEND MOLD_ELF_TARGETS
-  X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE
-  PPC32 PPC64V1 PPC64V2 S390X SPARC64 M68K SH4 ALPHA)
+  X86_64 I386 ARM64 ARM32 RV32LE RV32BE RV64LE RV64BE PPC32 PPC64V1 PPC64V2
+  S390X SPARC64 M68K SH4 ALPHA MIPS64LE MIPS64BE)
 
 list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/cmdline.cc
@@ -365,6 +365,7 @@ target_sources(mold PRIVATE
   elf/arch-arm64.cc
   elf/arch-i386.cc
   elf/arch-m68k.cc
+  elf/arch-mips64.cc
   elf/arch-ppc32.cc
   elf/arch-ppc64v1.cc
   elf/arch-ppc64v2.cc
@@ -440,6 +441,9 @@ if(NOT CMAKE_SKIP_INSTALL_RULES)
 
   if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
     install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+  endif()
+  if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE.third-party")
+    install(FILES "LICENSE.third-party" DESTINATION "${CMAKE_INSTALL_DOCDIR}")
   endif()
 
   function(mold_install_relative_symlink OLD NEW)

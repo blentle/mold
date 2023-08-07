@@ -4,7 +4,6 @@
 #include <functional>
 #include <map>
 #include <optional>
-#include <random>
 #include <regex>
 #include <shared_mutex>
 #include <tbb/parallel_for_each.h>
@@ -58,13 +57,14 @@ void create_synthetic_sections(Context<E> &ctx) {
     else
       ctx.phdr = push(new OutputPhdr<E>(0));
 
-    ctx.shdr = push(new OutputShdr<E>);
+    if (ctx.arg.z_sectionheader)
+      ctx.shdr = push(new OutputShdr<E>);
   }
 
   ctx.got = push(new GotSection<E>);
 
   if constexpr (!is_sparc<E>)
-    ctx.gotplt = push(new GotPltSection<E>);
+    ctx.gotplt = push(new GotPltSection<E>(ctx));
 
   ctx.reldyn = push(new RelDynSection<E>);
   ctx.relplt = push(new RelPltSection<E>);
@@ -82,7 +82,7 @@ void create_synthetic_sections(Context<E> &ctx) {
   ctx.copyrel = push(new CopyrelSection<E>(false));
   ctx.copyrel_relro = push(new CopyrelSection<E>(true));
 
-  if (!ctx.arg.oformat_binary)
+  if (ctx.shdr)
     ctx.shstrtab = push(new ShstrtabSection<E>);
 
   if (!ctx.arg.dynamic_linker.empty())
@@ -113,6 +113,8 @@ void create_synthetic_sections(Context<E> &ctx) {
   ctx.note_package = push(new NotePackageSection<E>);
   ctx.note_property = push(new NotePropertySection<E>);
 
+  if constexpr (is_riscv<E>)
+    ctx.extra.riscv_attributes = push(new RiscvAttributesSection<E>);
 
   if constexpr (is_ppc64v1<E>)
     ctx.extra.opd = push(new PPC64OpdSection);
@@ -125,6 +127,13 @@ void create_synthetic_sections(Context<E> &ctx) {
 
   if constexpr (is_alpha<E>)
     ctx.extra.got = push(new AlphaGotSection);
+
+  if constexpr (is_mips<E>) {
+    ctx.extra.quickstart = push(new MipsQuickstartSection<E>);
+
+    for (ObjectFile<E> *file : ctx.objs)
+      file->extra.got = push(new MipsGotSection<E>(ctx, *file));
+  }
 
   // If .dynamic exists, .dynsym and .dynstr must exist as well
   // since .dynamic refers them.
@@ -744,6 +753,9 @@ void add_synthetic_symbols(Context<E> &ctx) {
   if constexpr (is_ppc32<E>)
     ctx.extra._SDA_BASE_ = add("_SDA_BASE_");
 
+  if constexpr (is_mips<E>)
+    ctx._gp = add("_gp");
+
   for (Chunk<E> *chunk : ctx.chunks) {
     if (std::optional<std::string> name = get_start_stop_name(ctx, *chunk)) {
       add(save_string(ctx, "__start_" + *name));
@@ -1103,37 +1115,35 @@ template <typename E>
 void shuffle_sections(Context<E> &ctx) {
   Timer t(ctx, "shuffle_sections");
 
-  auto is_eligible = [](OutputSection<E> &osec) {
-    return osec.name != ".init" && osec.name != ".fini" &&
-           osec.name != ".ctors" && osec.name != ".dtors" &&
-           osec.name != ".init_array" && osec.name != ".preinit_array" &&
-           osec.name != ".fini_array";
+  auto is_eligible = [](OutputSection<E> *osec) {
+    if (osec) {
+      std::string_view name = osec->name;
+      return name != ".init" && name != ".fini" &&
+             name != ".ctors" && name != ".dtors" &&
+             name != ".init_array" && name != ".preinit_array" &&
+             name != ".fini_array";
+    }
+    return false;
   };
 
   switch (ctx.arg.shuffle_sections) {
-  case SHUFFLE_SECTIONS_NONE:
-    unreachable();
   case SHUFFLE_SECTIONS_SHUFFLE: {
-    u64 seed;
-    if (ctx.arg.shuffle_sections_seed)
-      seed = *ctx.arg.shuffle_sections_seed;
-    else
-      seed = ((u64)std::random_device()() << 32) | std::random_device()();
-
     tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-      if (OutputSection<E> *osec = chunk->to_osec())
-        if (is_eligible(*osec))
-          shuffle(osec->members, seed + hash_string(osec->name));
+      if (OutputSection<E> *osec = chunk->to_osec(); is_eligible(osec)) {
+        u64 seed = ctx.arg.shuffle_sections_seed + hash_string(osec->name);
+        shuffle(osec->members, seed);
+      }
     });
     break;
   }
   case SHUFFLE_SECTIONS_REVERSE:
     tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-      if (OutputSection<E> *osec = chunk->to_osec())
-        if (is_eligible(*osec))
-          std::reverse(osec->members.begin(), osec->members.end());
+      if (OutputSection<E> *osec = chunk->to_osec(); is_eligible(osec))
+        std::reverse(osec->members.begin(), osec->members.end());
     });
     break;
+  default:
+    unreachable();
   }
 }
 
@@ -1346,6 +1356,9 @@ void scan_relocations(Context<E> &ctx) {
   std::vector<Symbol<E> *> syms = flatten(vec);
   ctx.symbol_aux.reserve(syms.size());
 
+  if (ctx.needs_tlsld)
+    ctx.got->add_tlsld(ctx);
+
   // Assign offsets in additional tables for each dynamic symbol.
   for (Symbol<E> *sym : syms) {
     sym->add_aux(ctx);
@@ -1396,11 +1409,11 @@ void scan_relocations(Context<E> &ctx) {
     sym->flags = 0;
   }
 
-  if (ctx.needs_tlsld)
-    ctx.got->add_tlsld(ctx);
-
   if constexpr (is_alpha<E>)
     ctx.extra.got->finalize();
+
+  if constexpr (is_mips<E>)
+    mips_merge_got_sections(ctx);
 
   if (ctx.has_textrel && ctx.arg.warn_textrel)
     Warn(ctx) << "creating a DT_TEXTREL in an output file";
@@ -2259,17 +2272,18 @@ i64 set_osec_offsets(Context<E> &ctx) {
     else
       set_virtual_addresses_by_order(ctx);
 
-    i64 fileoff = set_file_offsets(ctx);
-
     // Assigning new offsets may change the contents and the length
     // of the program header, so repeat it until converge.
-    if (!ctx.phdr)
-      return fileoff;
+    i64 fileoff = set_file_offsets(ctx);
 
-    i64 sz = ctx.phdr->shdr.sh_size;
-    ctx.phdr->update_shdr(ctx);
-    if (sz == ctx.phdr->shdr.sh_size)
-      return fileoff;
+    if (ctx.phdr) {
+      i64 sz = ctx.phdr->shdr.sh_size;
+      ctx.phdr->update_shdr(ctx);
+      if (sz != ctx.phdr->shdr.sh_size)
+        continue;
+    }
+
+    return fileoff;
   }
 }
 
@@ -2444,6 +2458,10 @@ void fix_synthetic_symbols(Context<E> &ctx) {
     }
   }
 
+  // MIPS' _gp symbol.
+  if constexpr (is_mips<E>)
+    start(ctx._gp, ctx.extra.quickstart, 0x7ff0);
+
   // __start_ and __stop_ symbols
   for (Chunk<E> *chunk : sections) {
     if (std::optional<std::string> name = get_start_stop_name(ctx, *chunk)) {
@@ -2509,7 +2527,8 @@ i64 compress_debug_sections(Context<E> &ctx) {
     ctx.chunks[i] = comp;
   });
 
-  ctx.shstrtab->update_shdr(ctx);
+  if (ctx.shstrtab)
+    ctx.shstrtab->update_shdr(ctx);
 
   if (ctx.ehdr)
     ctx.ehdr->update_shdr(ctx);

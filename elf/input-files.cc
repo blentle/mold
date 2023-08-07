@@ -140,6 +140,82 @@ ObjectFile<E>::read_note_gnu_property(Context<E> &ctx, const ElfShdr<E> &shdr) {
   }
 }
 
+static inline std::string_view read_string(std::string_view &str) {
+  i64 pos = str.find_first_of('\0');
+  std::string_view val = str.substr(0, pos);
+  str = str.substr(pos + 1);
+  return val;
+}
+
+// <format-version>
+// [ <section-length> "vendor-name" <file-tag> <size> <attribute>*]+ ]*
+template <typename E>
+static void read_riscv_attributes(Context<E> &ctx, ObjectFile<E> &file,
+                                  std::string_view data) {
+const char *begin = data.data();
+  if (data.empty())
+    Fatal(ctx) << file << ": corrupted .riscv.attributes section";
+
+  if (u8 format_version = data[0]; format_version != 'A')
+    return;
+  data = data.substr(1);
+
+  while (!data.empty()) {
+    i64 sz = *(U32<E> *)data.data();
+    if (data.size() < sz)
+      Fatal(ctx) << file << ": corrupted .riscv.attributes section";
+
+    std::string_view p(data.data() + 4, sz - 4);
+    data = data.substr(sz);
+
+    if (!p.starts_with("riscv\0"sv))
+      continue;
+    p = p.substr(6);
+
+    if (!p.starts_with(ELF_TAG_FILE))
+      Fatal(ctx) << file << ": corrupted .riscv.attributes section";
+    p = p.substr(5); // skip the tag and the sub-sub-section size
+
+    while (!p.empty()) {
+      i64 tag = read_uleb(&p);
+
+      switch (tag) {
+      case ELF_TAG_RISCV_STACK_ALIGN:
+        file.extra.stack_align = read_uleb(&p);
+        break;
+      case ELF_TAG_RISCV_ARCH:
+        file.extra.arch = read_string(p);
+        break;
+      case ELF_TAG_RISCV_UNALIGNED_ACCESS:
+        file.extra.unaligned_access = read_uleb(&p);
+        break;
+      default:
+        break;
+      }
+    }
+  }
+}
+
+template <typename E>
+static u64 read_mips_gp0(Context<E> &ctx, InputSection<E> &isec) {
+  std::string_view data = isec.contents;
+  while (!data.empty()) {
+    if (data.size() < sizeof(MipsOptions<E>))
+      Fatal(ctx) << isec << ": corrupted .MIPS.options section";
+
+    MipsOptions<E> *opt = (MipsOptions<E> *)data.data();
+    if (opt->kind == ODK_REGINFO) {
+      if (data.size() < sizeof(MipsOptions<E>) + sizeof(MipsRegInfo<E>))
+        Fatal(ctx) << isec << ": corrupted .MIPS.options section";
+      MipsRegInfo<E> *info = (MipsRegInfo<E> *)(opt + 1);
+      return info->ri_gp_value;
+    }
+
+    data = data.substr(opt->size);
+  }
+  return 0;
+}
+
 template <typename E>
 void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
   // Read sections
@@ -149,6 +225,17 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
     if ((shdr.sh_flags & SHF_EXCLUDE) && !(shdr.sh_flags & SHF_ALLOC) &&
         shdr.sh_type != SHT_LLVM_ADDRSIG && !ctx.arg.relocatable)
       continue;
+
+    if constexpr (is_arm<E>)
+      if (shdr.sh_type == SHT_ARM_ATTRIBUTES)
+        continue;
+
+    if constexpr (is_riscv<E>) {
+      if (shdr.sh_type == SHT_RISCV_ATTRIBUTES) {
+        read_riscv_attributes(ctx, *this, this->get_string(ctx, shdr));
+        continue;
+      }
+    }
 
     switch (shdr.sh_type) {
     case SHT_GROUP: {
@@ -160,7 +247,7 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       std::string_view signature;
       if (esym.st_type == STT_SECTION) {
         signature = this->shstrtab.data() +
-                    this->elf_sections[esym.st_shndx].sh_name;
+                    this->elf_sections[get_shndx(esym)].sh_name;
       } else {
         signature = this->symbol_strtab.data() + esym.st_name;
       }
@@ -186,15 +273,20 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       comdat_groups.push_back({group, (u32)i, entries.subspan(1)});
       break;
     }
-    case SHT_SYMTAB_SHNDX:
-      symtab_shndx_sec = this->template get_data<U32<E>>(ctx, shdr);
+    case SHT_REL:
+      if constexpr (E::is_rela)
+        Fatal(ctx) << *this << ": REL-type relocation table is not supported"
+                   << " for this target";
+      break;
+    case SHT_RELA:
+      if constexpr (!E::is_rela)
+        Fatal(ctx) << *this <<": RELA-type relocation table is not supported"
+                   << " for this target";
       break;
     case SHT_SYMTAB:
+    case SHT_SYMTAB_SHNDX:
     case SHT_STRTAB:
-    case SHT_REL:
-    case SHT_RELA:
     case SHT_NULL:
-    case SHT_ARM_ATTRIBUTES:
       break;
     default: {
       std::string_view name = this->shstrtab.data() + shdr.sh_name;
@@ -203,8 +295,11 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       // area in GNU linkers. We ignore that section because silently
       // making the stack area executable is too dangerous. Tell our
       // users about the difference if that matters.
+      //
+      // MIPS object files don't contain .note.GNU-stack for some reason,
+      // so ignore this error on MIPS.
       if (name == ".note.GNU-stack" && !ctx.arg.relocatable) {
-        if (shdr.sh_flags & SHF_EXECINSTR) {
+        if ((shdr.sh_flags & SHF_EXECINSTR) && !is_mips<E>) {
           if (!ctx.arg.z_execstack && !ctx.arg.z_execstack_if_needed)
             Warn(ctx) << *this << ": this file may cause a segmentation"
               " fault because it requires an executable stack. See"
@@ -257,7 +352,11 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
 
       if constexpr (is_ppc32<E>)
         if (name == ".got2")
-          ppc32_got2 = this->sections[i].get();
+          extra.got2 = this->sections[i].get();
+
+      if constexpr (is_mips<E>)
+        if (name == ".MIPS.options")
+          extra.gp0 = read_mips_gp0(ctx, *this->sections[i]);
 
       // Save debug sections for --gdb-index.
       if (ctx.arg.gdb_index) {
@@ -809,7 +908,7 @@ void ObjectFile<E>::mark_addrsig(Context<E> &ctx) {
     u8 *end = cur + llvm_addrsig->contents.size();
 
     while (cur != end) {
-      Symbol<E> &sym = *this->symbols[read_uleb(cur)];
+      Symbol<E> &sym = *this->symbols[read_uleb(&cur)];
       if (sym.file == this)
         if (InputSection<E> *isec = sym.get_input_section())
           isec->address_significant = true;
@@ -839,6 +938,9 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
     this->first_global = symtab_sec->sh_info;
     this->elf_syms = this->template get_data<ElfSym<E>>(ctx, *symtab_sec);
     this->symbol_strtab = this->get_string(ctx, symtab_sec->sh_link);
+
+    if (ElfShdr<E> *shdr = this->find_section(SHT_SYMTAB_SHNDX))
+      symtab_shndx_sec = this->template get_data<U32<E>>(ctx, *shdr);
   }
 
   initialize_sections(ctx);
@@ -999,6 +1101,12 @@ void ObjectFile<E>::scan_relocations(Context<E> &ctx) {
   for (CieRecord<E> &cie : cies) {
     for (ElfRel<E> &rel : cie.get_rels()) {
       Symbol<E> &sym = *this->symbols[rel.r_sym];
+
+      if constexpr (!is_mips<E>)
+        if (ctx.arg.pic && rel.r_type == E::R_ABS)
+          Error(ctx) << *this << ": relocation " << rel << " in .eh_frame can"
+                     << " not be used when making a position-independent output;"
+                     << " recompile with -fPIE or -fPIC";
 
       if (sym.is_imported) {
         if (sym.get_type() != STT_FUNC)
@@ -1162,8 +1270,7 @@ void ObjectFile<E>::populate_symtab(Context<E> &ctx) {
   auto write_sym = [&](Symbol<E> &sym, i64 &symtab_idx) {
     U32<E> *xindex = nullptr;
     if (ctx.symtab_shndx)
-      xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset +
-                          symtab_idx * 4);
+      xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset) + symtab_idx;
 
     symtab_base[symtab_idx++] = to_output_esym(ctx, sym, strtab_off, xindex);
     strtab_off += write_string(strtab_base + strtab_off, sym.name());
@@ -1369,7 +1476,8 @@ SharedFile<E>::mark_live_objects(Context<E> &ctx,
     if (sym.is_traced)
       print_trace_symbol(ctx, *this, esym, sym);
 
-    if (esym.is_undef() && sym.file && !sym.file->is_alive.test_and_set()) {
+    if (esym.is_undef() && !esym.is_weak() && sym.file &&
+        !sym.file->is_alive.test_and_set()) {
       feeder(sym.file);
 
       if (sym.is_traced)
@@ -1466,8 +1574,8 @@ void SharedFile<E>::populate_symtab(Context<E> &ctx) {
 
     U32<E> *xindex = nullptr;
     if (ctx.symtab_shndx)
-      xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset +
-                          (this->global_symtab_idx + i) * 4);
+      xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset) +
+               this->global_symtab_idx + i;
 
     *symtab++ = to_output_esym(ctx, sym, strtab_off, xindex);
     strtab_off += write_string(strtab + strtab_off, sym.name());

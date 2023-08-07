@@ -50,6 +50,7 @@ template <typename E> struct CieRecord;
 template <typename E> struct Context;
 template <typename E> struct FdeRecord;
 template <typename E> class RelocSection;
+template <typename E> class MipsGotSection;
 
 template <typename E>
 std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym);
@@ -300,10 +301,10 @@ private:
   void check_tlsle(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
 
   void apply_dyn_absrel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel,
-                        u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> *&dynrel);
+                        u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> **dynrel);
 
   void apply_toc_rel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel,
-                     u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> *&dynrel);
+                     u8 *loc, u64 S, i64 A, u64 P, ElfRel<E> **dynrel);
 
   void copy_contents_riscv(Context<E> &ctx, u8 *buf);
 
@@ -368,6 +369,7 @@ public:
   std::string_view name;
   ElfShdr<E> shdr = { .sh_addralign = 1 };
   i64 shndx = 0;
+  bool is_relro = false;
 
   // Some synethetic sections add local symbols to the output.
   // For example, range extension thunks adds function_name@thunk
@@ -479,13 +481,14 @@ class GotSection : public Chunk<E> {
 public:
   GotSection() {
     this->name = ".got";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
 
     // We always create a .got so that _GLOBAL_OFFSET_TABLE_ has
-    // something to point to. s390x psABI defines GOT[1] as a
-    // reserved slot, so we allocate one more on s390x.
+    // something to point to. s390x/MIPS psABIs define GOT[1] as a
+    // reserved slot, so we allocate one more for them.
     this->shdr.sh_size = (is_s390x<E> ? 2 : 1) * sizeof(Word<E>);
   }
 
@@ -504,9 +507,9 @@ public:
   void populate_symtab(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> got_syms;
-  std::vector<Symbol<E> *> gottp_syms;
   std::vector<Symbol<E> *> tlsgd_syms;
   std::vector<Symbol<E> *> tlsdesc_syms;
+  std::vector<Symbol<E> *> gottp_syms;
   u32 tlsld_idx = -1;
 
   void construct_relr(Context<E> &ctx);
@@ -516,8 +519,9 @@ public:
 template <typename E>
 class GotPltSection : public Chunk<E> {
 public:
-  GotPltSection() {
+  GotPltSection(Context<E> &ctx) {
     this->name = ".got.plt";
+    this->is_relro = ctx.arg.z_now;
     this->shdr.sh_type = is_ppc64<E> ? SHT_NOBITS : SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
@@ -669,6 +673,7 @@ class DynamicSection : public Chunk<E> {
 public:
   DynamicSection() {
     this->name = ".dynamic";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_DYNAMIC;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = sizeof(Word<E>);
@@ -800,7 +805,7 @@ public:
   }
 
   void construct(Context<E> &ctx);
-  void apply_reloc(Context<E> &ctx, const ElfRel<E> &rel, u64 offset, u64 val);
+  void apply_eh_reloc(Context<E> &ctx, const ElfRel<E> &rel, u64 offset, u64 val);
   void copy_buf(Context<E> &ctx) override;
 };
 
@@ -841,8 +846,9 @@ public:
 template <typename E>
 class CopyrelSection : public Chunk<E> {
 public:
-  CopyrelSection(bool is_relro) : is_relro(is_relro) {
+  CopyrelSection(bool is_relro) {
     this->name = is_relro ? ".copyrel.rel.ro" : ".copyrel";
+    this->is_relro = is_relro;
     this->shdr.sh_type = SHT_NOBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
   }
@@ -852,7 +858,6 @@ public:
   i64 get_reldyn_size(Context<E> &ctx) const override { return symbols.size(); }
   void copy_buf(Context<E> &ctx) override;
 
-  bool is_relro;
   std::vector<Symbol<E> *> symbols;
 };
 
@@ -1040,6 +1045,7 @@ class RelroPaddingSection : public Chunk<E> {
 public:
   RelroPaddingSection() {
     this->name = ".relro_padding";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_NOBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = 1;
@@ -1189,6 +1195,25 @@ protected:
   std::vector<Symbol<E>> frag_syms;
 };
 
+template <typename E> struct ObjectFileExtras {};
+
+template <typename E> requires is_riscv<E>
+struct ObjectFileExtras<E> {
+  std::optional<i64> stack_align;
+  std::optional<std::string_view> arch;
+  bool unaligned_access = false;
+};
+
+template <> struct ObjectFileExtras<PPC32> {
+  InputSection<PPC32> *got2 = nullptr;
+};
+
+template <typename E> requires is_mips<E>
+struct ObjectFileExtras<E> {
+  MipsGotSection<E> *got = nullptr;
+  u64 gp0 = 0;
+};
+
 // ObjectFile represents an input .o file.
 template <typename E>
 class ObjectFile : public InputFile<E> {
@@ -1257,8 +1282,8 @@ public:
   // For LTO
   std::vector<std::string_view> lto_symbol_versions;
 
-  // For PPC32
-  InputSection<E> *ppc32_got2 = nullptr;
+  // Target-specific member
+  [[no_unique_address]] ObjectFileExtras<E> extra;
 
 private:
   ObjectFile(Context<E> &ctx, MappedFile<Context<E>> *mf,
@@ -1454,6 +1479,20 @@ void fixup_arm_exidx_section(Context<ARM32> &ctx);
 // arch-riscv64.cc
 //
 
+template <typename E> requires is_riscv<E>
+class RiscvAttributesSection : public Chunk<E> {
+public:
+  RiscvAttributesSection() {
+    this->name = ".riscv.attributes";
+    this->shdr.sh_type = SHT_RISCV_ATTRIBUTES;
+  }
+
+  void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
+
+  std::vector<u8> contents;
+};
+
 template <typename E>
 i64 riscv_resize_sections(Context<E> &ctx);
 
@@ -1507,6 +1546,7 @@ class AlphaGotSection : public Chunk<ALPHA> {
 public:
   AlphaGotSection() {
     this->name = ".alpha_got";
+    this->is_relro = true;
     this->shdr.sh_type = SHT_PROGBITS;
     this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
     this->shdr.sh_addralign = 8;
@@ -1528,6 +1568,70 @@ private:
   std::vector<Entry> entries;
   std::mutex mu;
 };
+
+//
+// arch-mips64.cc
+//
+
+template <typename E>
+class MipsQuickstartSection : public Chunk<E> {
+public:
+  MipsQuickstartSection() {
+    this->name = ".mips_quickstart";
+    this->is_relro = true;
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE | SHF_MIPS_GPREL;
+    this->shdr.sh_addralign = 8;
+  }
+
+  static constexpr i64 NUM_RESERVED = 2;
+
+  void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
+};
+
+template <typename E>
+class MipsGotSection : public Chunk<E> {
+public:
+  MipsGotSection(Context<E> &ctx, const ObjectFile<E> &file) {
+    this->name = save_string(ctx, ".mips_got." + std::to_string(file.priority));
+    this->is_relro = true;
+    this->shdr.sh_type = SHT_PROGBITS;
+    this->shdr.sh_flags = SHF_ALLOC | SHF_WRITE | SHF_MIPS_GPREL;
+    this->shdr.sh_addralign = 8;
+  }
+
+  u64 get_got_addr(Context<E> &ctx, Symbol<E> &sym, i64 addend) const;
+  u64 get_gotpage_addr(Context<E> &ctx, Symbol<E> &sym, i64 addend) const;
+  u64 get_tlsgd_addr(Context<E> &ctx, Symbol<E> &sym) const;
+  u64 get_gottp_addr(Context<E> &ctx, Symbol<E> &sym) const;
+  u64 get_tlsld_addr(Context<E> &ctx) const;
+
+  void update_shdr(Context<E> &ctx) override;
+  i64 get_reldyn_size(Context<E> &ctx) const override;
+  void copy_buf(Context<E> &ctx) override;
+
+  struct SymbolAddend {
+    bool operator==(const SymbolAddend &) const = default;
+    bool operator<(const SymbolAddend &) const;
+    u64 get_addr(Context<E> &ctx, i64 flags = 0) const;
+
+    Symbol<E> *sym;
+    i64 addend;
+  };
+
+  std::vector<SymbolAddend> got_syms;
+  std::vector<SymbolAddend> gotpage_syms;
+  std::vector<Symbol<E> *> tlsgd_syms;
+  std::vector<Symbol<E> *> gottp_syms;
+  bool has_tlsld = false;
+};
+
+template <typename E>
+void mips_merge_got_sections(Context<E> &ctx);
+
+template <typename E>
+void mips_rewrite_cie(Context<E> &ctx, u8 *buf, CieRecord<E> &cie);
 
 //
 // main.cc
@@ -1584,6 +1688,11 @@ struct SectionOrder {
 // Target-specific context members
 template <typename E> struct ContextExtras {};
 
+template <typename E> requires is_riscv<E>
+struct ContextExtras<E> {
+  RiscvAttributesSection<E> *riscv_attributes = nullptr;
+};
+
 template <> struct ContextExtras<PPC32> {
   Symbol<PPC32> *_SDA_BASE_ = nullptr;
 };
@@ -1605,6 +1714,11 @@ template <> struct ContextExtras<SPARC64> {
 
 template <> struct ContextExtras<ALPHA> {
   AlphaGotSection *got = nullptr;
+};
+
+template <typename E> requires is_mips<E>
+struct ContextExtras<E> {
+  MipsQuickstartSection<E> *quickstart = nullptr;
 };
 
 // Context represents a context object for each invocation of the linker.
@@ -1649,7 +1763,7 @@ struct Context {
     bool fork = true;
     bool gc_sections = false;
     bool gdb_index = false;
-    bool hash_style_gnu = true;
+    bool hash_style_gnu = !is_mips<E>;
     bool hash_style_sysv = true;
     bool icf = false;
     bool icf_all = false;
@@ -1700,22 +1814,23 @@ struct Context {
     bool z_now = false;
     bool z_origin = false;
     bool z_relro = true;
+    bool z_sectionheader = true;
     bool z_shstk = false;
     bool z_text = false;
     i64 filler = -1;
     i64 spare_dynamic_tags = 5;
     i64 thread_count = 0;
     i64 z_stack_size = 0;
+    u64 shuffle_sections_seed;
     std::string_view emulation;
     std::optional<Glob> unique;
     std::optional<u64> physical_image_base;
-    std::optional<u64> shuffle_sections_seed;
     std::string Map;
     std::string chroot;
     std::string dependency_file;
     std::string directory;
     std::string dynamic_linker;
-    std::string entry = "_start";
+    std::string entry = is_mips<E> ? "__start" : "_start";
     std::string fini = "_fini";
     std::string init = "_init";
     std::string output = "a.out";
@@ -1876,6 +1991,7 @@ struct Context {
   Symbol<E> *_edata = nullptr;
   Symbol<E> *_end = nullptr;
   Symbol<E> *_etext = nullptr;
+  Symbol<E> *_gp = nullptr;
   Symbol<E> *edata = nullptr;
   Symbol<E> *end = nullptr;
   Symbol<E> *etext = nullptr;
